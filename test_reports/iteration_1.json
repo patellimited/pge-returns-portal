@@ -1,0 +1,31 @@
+{
+  "summary": "Iteration 6 backend-only testing. Verified Easyship replaced Shiptheory as fallback rate provider, store-credit closes returns (closed=true, closed_reason='store_credit_applied'), mark-refunded closes returns (closed_reason='refunded'), existing-items still reports items from closed store-credit returns so the same line item can't re-apply, and the 'Store credit has already been applied' 409 branch exists in server.py. 10/10 tests passed against the external preview URL.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_iter6_easyship_storecredit.py",
+    "/app/test_reports/pytest/iter6_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is 1814 lines — consider splitting admin/returns/customer routes into separate routers for maintainability (not a blocker).",
+    "integrations_ping.test_all imports easyship_service locally inside the function (line 105). Works fine but top-level import would be cleaner and consistent with the rest.",
+    "Response shape of GET /api/admin/settings and PUT /api/admin/settings returns flat settings object (contains easyship_api_key, easyship_api_key_set, easyship_api_key_preview). Tests pass with flat shape. Good.",
+    "Store-credit conflict branch at server.py:305-318 correctly returns HTTP 409 with message starting with 'Store credit has already been applied for: ...'. Reachable only via real Woo flow — verified by code path + the existing-items persistence test which exercises the same DB query.",
+    "mark-refunded endpoint at server.py:1782 now sets closed=true/closed_reason='refunded'/closed_at alongside refunded=true and status='refunded' — verified by MongoDB round-trip test."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "not tested (skipped per request)"},
+  "test_credentials": "admin@pgelimited.com / admin123 (from /app/backend/.env). /app/memory/test_credentials.md is present but empty — flagged for future runs.",
+  "seed_data_creation": "Inserted and cleaned up two temporary returns docs: id='r-sc-test-iter6' (order TEST-SC-999) and id='r-mkref-test-iter6' (order TEST-MKREF-1). Also persisted easyship_api_key='test_eas_abc123xyz' in app_settings for the persistence test — this is a dummy test key and is intentionally left in the settings doc (masked in responses).",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Backend tests live at /app/backend/tests/test_iter6_easyship_storecredit.py. Run with: cd /app/backend && pytest tests/test_iter6_easyship_storecredit.py -v. Uses REACT_APP_BACKEND_URL from env. MongoDB writes to test_database.returns and app_settings. Woo/Stripe/Shippo keys are intentionally unset in dev — their connection-test results are expected to show ok=false; that is not a regression. Only 'easyship' key presence is verified in POST /api/admin/settings/test."
+}

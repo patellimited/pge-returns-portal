@@ -1,0 +1,683 @@
+diff --git a/backend/easyship_service.py b/backend/easyship_service.py
+index 517854d..e757b16 100644
+--- a/backend/easyship_service.py
++++ b/backend/easyship_service.py
+@@ -1,19 +1,25 @@
+-"""Easyship shipping rate + label provider (fallback).
++"""Easyship shipping rate + label provider.
+ 
+-Matches the same interface as shippo_service so server.py can call:
++Uses the NEW Easyship Advanced API hosted at https://api.easyship.com.
++(The legacy public-api.easyship.com/2023-01 endpoint authenticates but no
++longer returns rates for API keys issued from the new "Advanced API"
++dashboard — that's why rates silently come back empty.)
++
++Interface matches shippo_service so server.py can call:
+     create_shipment(api_key, address_from, address_to, parcel) -> {shipment_id, rates}
+-    purchase_label(api_key, rate_id, ...) -> {status, transaction_id, label_url, tracking_number}
++    purchase_label(api_key, rate_id, ...)                      -> {status, transaction_id, label_url, tracking_number}
+ 
+-Easyship's public API (v2023-01):
+-  - POST /2023-01/shipments  (create draft shipment, returns available couriers/rates)
+-  - POST /2023-01/labels     (confirm shipment + generate label)
+-  - GET  /2023-01/account    (ping)
++Flow:
++  - Rates:   POST https://api.easyship.com/rates      (Advanced API scope: Rates)
++  - Label:   POST https://api.easyship.com/shipments  (synchronous buy via
++             shipping_settings.buy_label + courier_selection.selected_courier_id)
+ 
+-Auth: `Authorization: Bearer {api_key}` using a personal-access / API key from
+-the Easyship dashboard → Settings → Integrations → API keys.
++Auth: `Authorization: Bearer {api_key}` — token from Easyship dashboard
++      → Connect → API Integrations → Access Token (production token prefixed `prod_`).
+ 
+-Any failure (missing key, network, auth, malformed response) MUST return
+-empty rates / a FAILED status — we never surface errors to the customer.
++Any failure (missing key, network, auth, malformed response) returns empty
++rates / a FAILED status so the customer never sees a raw error; the admin
++alert email (sent by server.py) surfaces the real reason.
+ """
+ from __future__ import annotations
+ import logging
+@@ -23,8 +29,9 @@ import requests
+ 
+ log = logging.getLogger("easyship")
+ 
+-BASE = "https://public-api.easyship.com/2023-01"
+-TIMEOUT = 15
++BASE = "https://api.easyship.com"
++PING_BASE = "https://public-api.easyship.com/2023-01"  # /account still lives here
++TIMEOUT = 20
+ 
+ 
+ def _headers(api_key: str) -> Dict[str, str]:
+@@ -35,9 +42,15 @@ def _headers(api_key: str) -> Dict[str, str]:
+     }
+ 
+ 
+-def _addr_from_obj(a) -> Dict[str, str]:
+-    """Accept dict or pydantic-style obj with the same fields as Address."""
++def _addr(a) -> Dict[str, str]:
++    """Accept dict or pydantic-style obj with Address fields."""
+     get = (lambda k: a.get(k, "") or "") if isinstance(a, dict) else (lambda k: getattr(a, k, "") or "")
++    # Normalise common country aliases to the 2-letter ISO code Easyship requires.
++    raw_country = (get("country") or "GB").strip().upper()
++    country = {
++        "UK": "GB", "UNITED KINGDOM": "GB", "GREAT BRITAIN": "GB",
++        "USA": "US", "UNITED STATES": "US",
++    }.get(raw_country, raw_country[:2])
+     name = (get("name") or "").strip()
+     first, _, last = name.partition(" ")
+     return {
+@@ -52,101 +65,109 @@ def _addr_from_obj(a) -> Dict[str, str]:
+         "city": get("city") or "-",
+         "state": get("state") or "",
+         "postal_code": get("zip") or "",
+-        "country_alpha2": (get("country") or "GB")[:2].upper(),
++        "country_alpha2": country,
+     }
+ 
+ 
+-def _parcel_items(parcel: Dict) -> List[Dict]:
+-    """Easyship shipments require an `items` array describing the contents.
+-    For a return shipment we declare a single generic item matching the parcel
+-    weight so the rate engine has enough info to quote couriers."""
++def _items_and_weight(parcel: Dict) -> (List[Dict], int):
++    """Build items[] + total weight in GRAMS (integer) — new API requirement."""
+     weight_kg = float((parcel or {}).get("weight") or 1.0)
+-    return [{
+-        "actual_weight": round(max(weight_kg, 0.05), 3),
+-        "height": float((parcel or {}).get("height") or 4),
+-        "width": float((parcel or {}).get("width") or 8),
+-        "length": float((parcel or {}).get("length") or 10),
++    weight_g = max(int(round(weight_kg * 1000.0)), 50)   # 50g floor so couriers quote
++    items = [{
+         "quantity": 1,
++        "hs_code": "",
++        "category": "others",
+         "declared_currency": "GBP",
+         "declared_customs_value": 1,
+         "description": "Customer return",
+-        "category": "others",
+-        "dimensions_unit": "cm",
+-        "weight_unit": "kg",
++        "weight": weight_g,
++        "weight_unit": "g",
++        "dimension_unit": "cm",
++        "height": float((parcel or {}).get("height") or 4),
++        "width": float((parcel or {}).get("width") or 8),
++        "length": float((parcel or {}).get("length") or 10),
+     }]
++    return items, weight_g
++
++
++def _box(parcel: Dict, box_slug: str) -> Dict:
++    return {
++        "slug": box_slug or "default",
++        "length": float((parcel or {}).get("length") or 10),
++        "width": float((parcel or {}).get("width") or 8),
++        "height": float((parcel or {}).get("height") or 4),
++        "outer_dimensions_unit": "cm",
++    }
++
++
++def _map_rate(rt: Dict, shipment_id: Optional[str] = None) -> Optional[Dict]:
++    """Normalise an Easyship rate into the portal's rate shape."""
++    cost = rt.get("total_charge") or rt.get("shipment_charge_total") \
++        or rt.get("total_charge_with_markup") or rt.get("total")
++    if cost is None:
++        return None
++    courier_id = rt.get("courier_id") or rt.get("id") or ""
++    if not courier_id:
++        return None
++    return {
++        "rate_id": f"es_{courier_id}",
++        "provider": rt.get("courier_display_name") or rt.get("courier_name") or "Easyship",
++        "servicelevel": rt.get("courier_name") or rt.get("service_name") or "",
++        "amount": float(cost),
++        "currency": (rt.get("currency") or "GBP").upper(),
++        "days": int(rt.get("max_delivery_time") or rt.get("min_delivery_time") or 0) or None,
++        "duration_terms": rt.get("description") or "",
++        "provider_image": rt.get("courier_logo_url") or "",
++        "_es_shipment_id": shipment_id,
++    }
+ 
+ 
+-def create_shipment(api_key: str, address_from, address_to, parcel: Dict) -> Dict:
+-    """Return a Shippo-compatible rates envelope via Easyship's /shipments.
++def create_shipment(api_key: str, address_from, address_to, parcel: Dict,
++                    box_slug: str = "default") -> Dict:
++    """Fetch rates via the new Advanced API `/rates` endpoint and return them
++    in the Shippo-compatible envelope the portal expects.
+ 
+-    Easyship's `POST /2023-01/shipments` returns the created shipment ID plus
+-    a list of eligible `rates` (couriers + prices + transit time). We map
+-    each of those into the portal's standard rate shape, prefixing the
+-    rate_id with `es_` so server.py can route label purchases back here.
++    Note: the new API separates rate quoting from shipment creation — no
++    shipment is actually created here, so `shipment_id` is None. The label
++    purchase step creates the shipment + buys the label in one call.
+     """
+     if not api_key:
+         return {"shipment_id": None, "rates": []}
+ 
++    items, total_g = _items_and_weight(parcel or {})
+     payload = {
+-        "origin_address": _addr_from_obj(address_from),
+-        "destination_address": _addr_from_obj(address_to),
++        "origin_address": _addr(address_from),
++        "destination_address": _addr(address_to),
+         "parcels": [{
+-            "box": {
+-                "slug": "custom",
+-                "length": float((parcel or {}).get("length") or 10),
+-                "width": float((parcel or {}).get("width") or 8),
+-                "height": float((parcel or {}).get("height") or 4),
+-                "outer_dimensions_unit": "cm",
+-            },
+-            "items": _parcel_items(parcel),
+-            "total_actual_weight": round(float((parcel or {}).get("weight") or 1.0), 3),
++            "box": _box(parcel or {}, box_slug),
++            "items": items,
++            "total_actual_weight": total_g,
+         }],
+-        "shipping_settings": {
+-            "units": {"weight": "kg", "dimensions": "cm"},
+-            "output_currency": "GBP",
+-            "buy_label": False,
+-            "buy_label_synchronous": False,
+-        },
+         "incoterms": "DDU",
+-        "is_insured": False,
++        "insurance": {"is_insured": False},
++        "output_currency": "GBP",
+     }
+ 
+     try:
+-        r = requests.post(f"{BASE}/shipments", json=payload,
++        r = requests.post(f"{BASE}/rates", json=payload,
+                           headers=_headers(api_key), timeout=TIMEOUT)
+         if r.status_code not in (200, 201):
+-            log.warning("easyship shipment create failed: %s %s",
+-                        r.status_code, r.text[:200])
++            log.warning("easyship /rates failed: %s %s",
++                        r.status_code, r.text[:300])
+             return {"shipment_id": None, "rates": []}
+         data = r.json() or {}
+-        shipment = data.get("shipment") or data
+-        shipment_id = shipment.get("easyship_shipment_id") or shipment.get("id")
+-        rates_raw = shipment.get("rates") or shipment.get("available_rates") or []
+-
++        rates_raw = data.get("rates") or data.get("available_rates") or []
+         rates: List[Dict] = []
+         for rt in rates_raw:
+-            cost = rt.get("total_charge") or rt.get("shipment_charge_total") \
+-                or rt.get("total_charge_with_markup") or rt.get("total")
+-            if cost is None:
+-                continue
+-            umbrella_id = rt.get("courier_id") or rt.get("id") or ""
+-            if not umbrella_id:
+-                continue
+-            rates.append({
+-                "rate_id": f"es_{umbrella_id}",
+-                "provider": rt.get("courier_display_name") or rt.get("courier_name") or "Easyship",
+-                "servicelevel": rt.get("courier_name") or rt.get("service_name") or "",
+-                "amount": float(cost),
+-                "currency": (rt.get("currency") or "GBP").upper(),
+-                "days": int(rt.get("max_delivery_time") or rt.get("delivery_time_rank") or 0) or None,
+-                "duration_terms": rt.get("description") or "",
+-                "provider_image": rt.get("courier_logo_url") or "",
+-                "_es_shipment_id": shipment_id,
+-            })
+-
+-        return {"shipment_id": shipment_id, "rates": rates}
++            m = _map_rate(rt)
++            if m:
++                rates.append(m)
++        if not rates:
++            log.warning("easyship /rates returned 200 but 0 rates (check couriers "
++                        "in dashboard, box slug, address): %s", r.text[:300])
++        return {"shipment_id": None, "rates": rates}
+     except Exception as e:
+-        log.warning("easyship shipment exception: %s", e)
++        log.warning("easyship /rates exception: %s", e)
+         return {"shipment_id": None, "rates": []}
+ 
+ 
+@@ -154,50 +175,70 @@ def purchase_label(api_key: str, rate_id: str,
+                    *, address_from=None, address_to=None,
+                    parcel: Optional[Dict] = None,
+                    reference: Optional[str] = None,
+-                   shipment_id: Optional[str] = None) -> Dict:
+-    """Confirm a shipment + buy the label via Easyship. Returns Shippo-compatible envelope.
++                   shipment_id: Optional[str] = None,
++                   box_slug: str = "default") -> Dict:
++    """Create a shipment + buy the label in one synchronous call via the new
++    Advanced API `/shipments` endpoint (shipping_settings.buy_label = true).
+ 
+-    rate_id carries the Easyship courier id prefixed with "es_" e.g. "es_abc123".
+-    A shipment must be created first — either via `create_shipment` (in which
+-    case the `_es_shipment_id` is stored on the rate and passed back in), or
+-    inline here if `shipment_id` isn't supplied.
++    rate_id carries the Easyship courier id prefixed with "es_" (stripped
++    back to the raw id before posting).
+     """
+     if not api_key:
+         return {"status": "FAILED", "transaction_id": None,
+-                "label_url": None, "tracking_number": None}
++                "label_url": None, "tracking_number": None,
++                "message": "Easyship key not configured"}
+ 
+     courier_id = rate_id[3:] if rate_id.startswith("es_") else rate_id
+-    # If we don't have a shipment yet, create one inline so we can buy the label.
+-    if not shipment_id:
+-        made = create_shipment(api_key, address_from, address_to, parcel or {})
+-        shipment_id = made.get("shipment_id")
+-        if not shipment_id:
+-            return {"status": "FAILED", "transaction_id": None,
+-                    "label_url": None, "tracking_number": None}
++    items, total_g = _items_and_weight(parcel or {})
++    payload = {
++        "origin_address": _addr(address_from),
++        "destination_address": _addr(address_to),
++        "parcels": [{
++            "box": _box(parcel or {}, box_slug),
++            "items": items,
++            "total_actual_weight": total_g,
++        }],
++        "incoterms": "DDU",
++        "insurance": {"is_insured": False},
++        "output_currency": "GBP",
++        "platform_name": "pge-returns-portal",
++        "platform_order_number": reference or "",
++        "courier_selection": {
++            "selected_courier_id": courier_id,
++            "apply_shipping_rules": False,
++        },
++        "shipping_settings": {
++            "units": {"weight": "g", "dimensions": "cm"},
++            "buy_label": True,
++            "buy_label_synchronous": True,
++            "printing_options": {"format": "pdf", "label": "4x6", "commercial_invoice": "A4"},
++        },
++    }
+ 
+     try:
+-        payload = {
+-            "easyship_shipment_id": shipment_id,
+-            "selected_courier_id": courier_id,
+-        }
+-        r = requests.post(f"{BASE}/labels", json=payload,
+-                          headers=_headers(api_key), timeout=30)
++        r = requests.post(f"{BASE}/shipments", json=payload,
++                          headers=_headers(api_key), timeout=45)
+         if r.status_code not in (200, 201, 202):
+-            log.warning("easyship label failed: %s %s", r.status_code, r.text[:200])
++            log.warning("easyship /shipments buy failed: %s %s",
++                        r.status_code, r.text[:300])
+             return {"status": "FAILED", "transaction_id": None,
+-                    "label_url": None, "tracking_number": None}
++                    "label_url": None, "tracking_number": None,
++                    "message": f"{r.status_code}: {r.text[:200]}"}
+         data = r.json() or {}
+-        # Response shape: {"shipment": {..., "label": {"url": ...},
+-        #                  "tracking_number": ...}} or batch-style
+-        shipment = data.get("shipment") or (data.get("shipments") or [{}])[0] or data
++        shipment = data.get("shipment") or data
+         label = shipment.get("label") or {}
+-        label_url = label.get("url") or label.get("base64_encoded_strings") \
+-            or shipment.get("label_url")
+-        tracking = shipment.get("tracking_number") or shipment.get("tracking_page_url") or ""
+-        tx_id = shipment.get("easyship_shipment_id") or shipment_id
++        label_url = (label.get("url") or label.get("base64_encoded_strings")
++                     or shipment.get("label_url"))
++        tracking = (shipment.get("tracking_number")
++                    or shipment.get("tracking_page_url") or "")
++        tx_id = (shipment.get("easyship_shipment_id")
++                 or shipment.get("id") or shipment_id)
+         if not label_url:
++            warning = shipment.get("warning_message") or shipment.get("error") \
++                or "Label URL missing in Easyship response"
+             return {"status": "FAILED", "transaction_id": tx_id,
+-                    "label_url": None, "tracking_number": tracking}
++                    "label_url": None, "tracking_number": tracking,
++                    "message": str(warning)[:300]}
+         return {
+             "status": "SUCCESS",
+             "transaction_id": tx_id,
+@@ -207,15 +248,16 @@ def purchase_label(api_key: str, rate_id: str,
+     except Exception as e:
+         log.warning("easyship label exception: %s", e)
+         return {"status": "FAILED", "transaction_id": None,
+-                "label_url": None, "tracking_number": None}
++                "label_url": None, "tracking_number": None,
++                "message": f"easyship: {e}"}
+ 
+ 
+ def ping(api_key: str) -> Dict:
+-    """Lightweight connectivity check used by integrations_ping."""
++    """Lightweight connectivity check. /account still lives on the legacy host."""
+     if not api_key:
+         return {"ok": False, "message": "No key set"}
+     try:
+-        r = requests.get(f"{BASE}/account", headers=_headers(api_key), timeout=10)
++        r = requests.get(f"{PING_BASE}/account", headers=_headers(api_key), timeout=10)
+         if r.status_code == 200:
+             data = r.json() or {}
+             email = (data.get("account") or data).get("email") or "ok"
+diff --git a/backend/email_service.py b/backend/email_service.py
+index 461b0b6..dc37d6e 100644
+--- a/backend/email_service.py
++++ b/backend/email_service.py
+@@ -397,6 +397,68 @@ async def send_admin_new_return(cfg, *, rma_number, order_number, customer_name,
+                             subject=subject, html=html, tags=["admin_new_return"])
+ 
+ 
++async def send_admin_label_failure(cfg, *, rma_number, return_id, error_message,
++                                   method_display_label, amount, currency,
++                                   customer_name, customer_email,
++                                   rate_provider="", rate_servicelevel="") -> Dict[str, Any]:
++    """Alert the store admin that a return label could not be purchased
++    (e.g. Shippo 'shipping provider not found', Easyship auth error, etc.).
++    The customer has usually already been charged or confirmed at this point,
++    so the admin needs to manually generate a label and email it to them.
++    """
++    store_name = cfg.get("store_name") or "Returns"
++    support_email = cfg.get("support_email") or (cfg.get("from_email") or "")
++    logo_url = cfg.get("logo_url") or ""
++    admin_to = (cfg.get("admin_notification_email") or "").strip()
++    if not admin_to:
++        return {"ok": False, "provider": None,
++                "attempts": [{"provider": "admin_notify", "ok": False,
++                              "message": "admin_notification_email not configured"}]}
++
++    def money(v):
++        try:
++            return f"{currency} {float(v):,.2f}"
++        except Exception:
++            return f"{currency} {v}"
++
++    inner = f"""
++      <div style="text-transform:uppercase;letter-spacing:0.18em;font-size:11px;color:#B91C1C">Action required · Label purchase failed</div>
++      <h1 style="margin:8px 0 16px;font-size:22px;font-weight:500">RMA {rma_number}</h1>
++      <p style="font-size:13px;margin:0 0 16px">
++        A return label could not be generated automatically. The customer is
++        waiting on a label — please buy one manually from your carrier dashboard
++        and email it to them, or reach out via your admin portal.
++      </p>
++
++      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E5E5E0;padding:16px;margin:16px 0;font-size:13px">
++        <tr><td style="padding:4px 0;color:#78716C">Customer</td><td align="right">{customer_name}</td></tr>
++        <tr><td style="padding:4px 0;color:#78716C">Email</td><td align="right">{customer_email}</td></tr>
++        <tr><td style="padding:4px 0;color:#78716C">Method</td><td align="right">{method_display_label}</td></tr>
++        <tr><td style="padding:4px 0;color:#78716C">Quoted rate</td><td align="right">{rate_provider} {rate_servicelevel}</td></tr>
++        <tr><td style="padding:4px 0;color:#78716C">Amount</td><td align="right">{money(amount)}</td></tr>
++        <tr><td style="padding:4px 0;color:#78716C">Return ID</td><td align="right"><span style="font-family:monospace">{return_id}</span></td></tr>
++      </table>
++
++      <div style="margin-top:16px;padding:12px;border-left:3px solid #B91C1C;background:#FEF2F2">
++        <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.18em;color:#B91C1C">Carrier error</div>
++        <div style="margin-top:4px;font-family:monospace;font-size:12px;white-space:pre-wrap">{error_message or 'Unknown error'}</div>
++      </div>
++
++      <p style="margin:24px 0 0;font-size:12px;color:#78716C">
++        Common causes: carrier not connected in Shippo/Easyship dashboard,
++        wrong API key (test vs live), insufficient account balance, or an
++        expired rate_id. Check the provider dashboard, then process the label
++        manually and forward it to the customer.
++      </p>
++    """
++    html = _base_html(store_name, support_email, logo_url, inner)
++    subject = f"[ACTION REQUIRED] Label purchase failed · RMA {rma_number} · {customer_name}"
++    return await send_email(cfg, to_email=admin_to, to_name=f"{store_name} Admin",
++                            subject=subject, html=html, tags=["admin_label_failure"])
++
++
++
++
+ 
+ async def send_free_label_approved(cfg, *, to_email, to_name, rma_number, order_number,
+                                    admin_note: str = "",
+diff --git a/backend/server.py b/backend/server.py
+index 3a53272..cae28b6 100644
+--- a/backend/server.py
++++ b/backend/server.py
+@@ -546,6 +546,7 @@ async def preview_rates(body: RatePreviewRequest):
+             r = easyship_service.create_shipment(
+                 api_key=cfg["easyship_api_key"],
+                 address_from=placeholder_from, address_to=warehouse, parcel=parcel,
++                box_slug=cfg.get("easyship_box_slug") or "default",
+             )
+             merged.extend(r.get("rates") or [])
+         except Exception as e:
+@@ -774,6 +775,7 @@ async def _all_rates(doc) -> Dict:
+             r = easyship_service.create_shipment(
+                 api_key=cfg["easyship_api_key"],
+                 address_from=addr_from, address_to=addr_to, parcel=parcel,
++                box_slug=cfg.get("easyship_box_slug") or "default",
+             )
+             merged.extend(r.get("rates") or [])
+         except Exception as e:
+@@ -811,29 +813,42 @@ def _purchase_label_multi(cfg: Dict[str, str], selected: Dict,
+                           parcel: Optional[Dict] = None,
+                           reference: Optional[str] = None) -> Dict:
+     """Book a label with the provider that owns this rate. Returns Shippo-
+-    compatible envelope {status, transaction_id, label_url, tracking_number}."""
++    compatible envelope {status, transaction_id, label_url, tracking_number,
++    message}. `message` carries the carrier's error text on failure so the
++    admin alert email can surface it (e.g. "shipping provider not found")."""
+     provider = _provider_for_rate(selected.get("rate_id"))
+     rid = selected["rate_id"]
+     try:
+         if provider == "easyship":
+-            return easyship_service.purchase_label(
++            res = easyship_service.purchase_label(
+                 api_key=cfg.get("easyship_api_key") or "",
+                 rate_id=rid, address_from=address_from, address_to=address_to,
+                 parcel=parcel, reference=reference,
+                 shipment_id=selected.get("_es_shipment_id"),
++                box_slug=cfg.get("easyship_box_slug") or "default",
+             )
+-        if provider == "royal_mail":
+-            return royal_mail_service.purchase_label(
++        elif provider == "royal_mail":
++            res = royal_mail_service.purchase_label(
+                 api_key=cfg.get("royal_mail_api_key") or "",
+                 rate_id=rid, address_from=address_from, address_to=address_to,
+                 parcel=parcel, reference=reference,
+             )
+-        # default: Shippo
+-        return shippo_service.purchase_label(cfg.get("shippo_api_key") or "", rid)
++        else:
++            # default: Shippo
++            res = shippo_service.purchase_label(cfg.get("shippo_api_key") or "", rid)
++        # Normalise: ensure a `message` field is present so callers can
++        # surface the carrier's error text if status != SUCCESS.
++        res = dict(res or {})
++        if res.get("status") != "SUCCESS" and not res.get("message"):
++            msgs = res.get("messages") or []
++            res["message"] = "; ".join([str(m) for m in msgs if m]) \
++                or f"{provider} returned status={res.get('status')}"
++        return res
+     except Exception as e:
+         log.warning("label purchase (%s) error: %s", provider, e)
+         return {"status": "FAILED", "transaction_id": None,
+-                "label_url": None, "tracking_number": None}
++                "label_url": None, "tracking_number": None,
++                "message": f"{provider}: {e}"}
+ 
+ @api.post("/returns/{return_id}/rates")
+ async def fetch_rates(return_id: str):
+@@ -985,7 +1000,50 @@ async def deduct_from_refund(return_id: str, body: CheckoutRequest):
+         reference=doc.get("rma_number"),
+     )
+     if label.get("status") != "SUCCESS":
+-        raise HTTPException(status_code=502, detail="Label purchase failed.")
++        # Graceful fallback: record the rate the customer picked + the error,
++        # mark awaiting-approval (so admin can fulfil manually), alert admin,
++        # and still return the return doc so the success page can render.
++        err_msg = label.get("message") or "Unknown carrier error"
++        log.warning("deduct-from-refund label failed: rma=%s err=%s",
++                    doc.get("rma_number"), err_msg)
++        await db.returns.update_one(
++            {"id": return_id},
++            {"$set": {
++                "shippo_rate_id": selected["rate_id"],
++                "selected_rate": selected,
++                "label_cost": float(selected["amount"]),
++                "refund_deduction": float(selected["amount"]),
++                "refund_net": max(float(doc.get("refund_amount") or 0.0) - float(selected["amount"]), 0.0),
++                "status": "awaiting_approval",
++                "label_error": err_msg,
++                "updated_at": datetime.now(timezone.utc).isoformat(),
++            },
++             "$push": {"customer_actions": CustomerAction(
++                 kind="label_purchase_failed",
++                 label="Label purchase failed — admin notified",
++                 meta={"error": err_msg, "rate_id": selected["rate_id"],
++                       "amount": float(selected["amount"])},
++             ).model_dump()}},
++        )
++        try:
++            await email_service.send_admin_label_failure(
++                cfg,
++                rma_number=doc.get("rma_number", ""),
++                return_id=return_id,
++                error_message=err_msg,
++                method_display_label=doc.get("method_display_label")
++                    or METHOD_DISPLAY.get(doc.get("method", ""), doc.get("method", "")),
++                amount=float(selected["amount"]),
++                currency=(selected.get("currency") or "GBP").upper(),
++                customer_name=(doc.get("return_address") or {}).get("name", ""),
++                customer_email=doc.get("email", ""),
++                rate_provider=selected.get("provider", ""),
++                rate_servicelevel=selected.get("servicelevel", ""),
++            )
++        except Exception as e:
++            log.warning("admin label-failure email error: %s", e)
++        updated = await db.returns.find_one({"id": return_id}, {"_id": 0})
++        return updated
+ 
+     await db.returns.update_one(
+         {"id": return_id},
+@@ -1068,6 +1126,7 @@ async def payment_status(session_id: str, request: Request):
+                         "tracking_number": label["tracking_number"],
+                         "tracking_carrier": (doc.get("selected_rate") or {}).get("provider"),
+                         "status": "label_purchased",
++                        "label_error": None,
+                         "updated_at": datetime.now(timezone.utc).isoformat(),
+                     },
+                      "$push": {"customer_actions": CustomerAction(
+@@ -1077,6 +1136,45 @@ async def payment_status(session_id: str, request: Request):
+                      ).model_dump()}},
+                 )
+                 # Email is sent by /finalize when the customer's success page loads.
++            else:
++                # Label purchase failed AFTER the customer was charged.
++                # Mark the return as paid-but-awaiting-manual-label and alert
++                # the admin so they can buy a label manually and email it.
++                err_msg = label.get("message") or "Unknown carrier error"
++                log.warning("label purchase failed after stripe paid: rma=%s err=%s",
++                            doc.get("rma_number"), err_msg)
++                await db.returns.update_one(
++                    {"id": return_id},
++                    {"$set": {
++                        "paid": True,
++                        "status": "awaiting_approval",
++                        "label_error": err_msg,
++                        "updated_at": datetime.now(timezone.utc).isoformat(),
++                    },
++                     "$push": {"customer_actions": CustomerAction(
++                         kind="label_purchase_failed",
++                         label="Label purchase failed after payment — admin notified",
++                         meta={"error": err_msg,
++                               "amount": float(tx.get("amount") or 0)},
++                     ).model_dump()}},
++                )
++                try:
++                    await email_service.send_admin_label_failure(
++                        cfg,
++                        rma_number=doc.get("rma_number", ""),
++                        return_id=return_id,
++                        error_message=err_msg,
++                        method_display_label=doc.get("method_display_label")
++                            or METHOD_DISPLAY.get(doc.get("method", ""), doc.get("method", "")),
++                        amount=float(tx.get("amount") or 0),
++                        currency=(tx.get("currency") or "GBP").upper(),
++                        customer_name=(doc.get("return_address") or {}).get("name", ""),
++                        customer_email=doc.get("email", ""),
++                        rate_provider=(doc.get("selected_rate") or {}).get("provider", ""),
++                        rate_servicelevel=(doc.get("selected_rate") or {}).get("servicelevel", ""),
++                    )
++                except Exception as e:
++                    log.warning("admin label-failure email error: %s", e)
+         except Exception as e:
+             log.exception("label purchase exception")
+ 
+diff --git a/backend/settings_service.py b/backend/settings_service.py
+index b4c0d71..1690ba8 100644
+--- a/backend/settings_service.py
++++ b/backend/settings_service.py
+@@ -14,6 +14,7 @@ SETTINGS_KEYS = [
+     "shippo_api_key",
+     # Easyship (fallback rate provider)
+     "easyship_api_key",
++    "easyship_box_slug",
+     # Royal Mail Click & Drop (fallback rate provider)
+     "royal_mail_api_key",
+     # Stripe
+@@ -47,6 +48,7 @@ ENV_MAP = {
+     "wc_consumer_secret": "WC_CONSUMER_SECRET",
+     "shippo_api_key": "SHIPPO_API_KEY",
+     "easyship_api_key": "EASYSHIP_API_KEY",
++    "easyship_box_slug": "EASYSHIP_BOX_SLUG",
+     "royal_mail_api_key": "ROYAL_MAIL_API_KEY",
+     "stripe_api_key": "STRIPE_API_KEY",
+     "stripe_publishable_key": "STRIPE_PUBLISHABLE_KEY",
+diff --git a/frontend/src/pages/AdminSettings.jsx b/frontend/src/pages/AdminSettings.jsx
+index 1e2cabb..395e62c 100644
+--- a/frontend/src/pages/AdminSettings.jsx
++++ b/frontend/src/pages/AdminSettings.jsx
+@@ -37,7 +37,8 @@ const FIELD_GROUPS = [
+     { key: "shippo_api_key", label: "API token", secret: true, placeholder: "shippo_live_... (or shippo_test_... for test mode)" },
+   ]},
+   { title: "Easyship (fallback rate provider)", fields: [
+-    { key: "easyship_api_key", label: "API key (Easyship dashboard → Connect → API keys)", secret: true, placeholder: "eas_prod_..." },
++    { key: "easyship_api_key", label: "API key (Easyship dashboard → Connect → API Integrations → Access Token, prod_…)", secret: true, placeholder: "prod_..." },
++    { key: "easyship_box_slug", label: "Box slug (Easyship → Settings → Boxes — lowercase slug like 'default' or 'returns')", secret: false, placeholder: "default" },
+   ]},
+   { title: "Royal Mail Click & Drop (fallback rate provider)", fields: [
+     { key: "royal_mail_api_key", label: "API key (Bearer token from Click & Drop → Settings → Integrations → API)", secret: true, placeholder: "rm_..." },
+diff --git a/frontend/src/pages/ReturnSuccess.jsx b/frontend/src/pages/ReturnSuccess.jsx
+index 6c58069..279f563 100644
+--- a/frontend/src/pages/ReturnSuccess.jsx
++++ b/frontend/src/pages/ReturnSuccess.jsx
+@@ -227,7 +227,27 @@ export default function ReturnSuccess() {
+             </p>
+           )}
+ 
+-          {!hasLabel && !isStoreCredit && doc.status === "awaiting_approval" && (
++          {!hasLabel && !isStoreCredit && doc.label_error && (
++            <div
++              className="mt-6 p-4 border-l-4 border-[hsl(var(--ink))] bg-[hsl(var(--surface))]"
++              data-testid="label-pending-panel"
++            >
++              <div className="label-caps mb-1">Label is being prepared</div>
++              <p className="text-sm">
++                {doc.paid
++                  ? "We've received your payment "
++                  : "We've received your return request "}
++                and our team has been notified. Your shipping label will be emailed to{" "}
++                <span className="mono text-[hsl(var(--ink))] break-all">{doc.email}</span>{" "}
++                within a few hours — no further action needed on your side.
++              </p>
++              <p className="mt-2 text-xs text-[hsl(var(--ink-muted))]">
++                Reference: RMA {doc.rma_number}
++              </p>
++            </div>
++          )}
++
++          {!hasLabel && !isStoreCredit && !doc.label_error && doc.status === "awaiting_approval" && (
+             <p className="mt-6 text-sm text-[hsl(var(--ink-muted))]">
+               Because you chose a free return label, our team will review your request and send
+               the label to <span className="mono text-[hsl(var(--ink))] break-all">{doc.email}</span> within 24 hours.
