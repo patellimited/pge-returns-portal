@@ -1017,3 +1017,106 @@ async def send_self_ship_tracking_reminder(cfg, *, to_email, to_name, rma_number
     subject = f"{store_name} · Reminder: add tracking for return {rma_number}"
     return await send_email(cfg, to_email=to_email, to_name=to_name, subject=subject,
                             html=html, tags=["self_ship_tracking_reminder"])
+
+
+# Friendly copy per status for the customer-subscribed status-change email.
+_STATUS_COPY = {
+    "in_transit": {
+        "kicker": "Your parcel is moving",
+        "kicker_color": "#0A0A0A",
+        "headline": "On its way to our warehouse.",
+        "body": ("The carrier has scanned your parcel — it's now in transit. "
+                 "We'll email again the moment it arrives."),
+    },
+    "delivered": {
+        "kicker": "Delivered",
+        "kicker_color": "#047857",
+        "headline": "We've got your parcel.",
+        "body": ("Your return parcel just arrived at our warehouse. Our team "
+                 "will inspect the items and process your refund or store "
+                 "credit shortly."),
+    },
+    "refunded": {
+        "kicker": "Refund processed",
+        "kicker_color": "#047857",
+        "headline": "Your refund is on its way.",
+        "body": ("All done — your refund has been processed back to the "
+                 "original payment method. Depending on your bank it can take "
+                 "5–10 business days to appear on your statement."),
+    },
+    "store_credit_issued": {
+        "kicker": "Store credit ready",
+        "kicker_color": "#047857",
+        "headline": "Your store credit has been issued.",
+        "body": ("We've issued your store credit for this return. Check the "
+                 "separate email from us with your unique coupon code — it's "
+                 "ready to use at checkout."),
+    },
+    "approved": {
+        "kicker": "Return approved",
+        "kicker_color": "#047857",
+        "headline": "You're all approved.",
+        "body": "Your return has been approved by our team and is ready to be shipped or processed.",
+    },
+    "rejected": {
+        "kicker": "Return update",
+        "kicker_color": "#B91C1C",
+        "headline": "Update on your return.",
+        "body": ("There's been an update to your return that needs your "
+                 "attention — please review the details below."),
+    },
+}
+
+
+async def send_status_update(cfg, *, to_email, to_name, rma_number, order_number,
+                             new_status: str, status_label: str = "",
+                             tracking_link: str = "") -> Dict[str, Any]:
+    """Customer-opt-in email fired when a tracked return changes to one of
+    the "interesting" statuses (in_transit / delivered / refunded /
+    store_credit_issued / approved / rejected). Customer subscribes to these
+    via the toggle on the public tracking page."""
+    store_name = cfg.get("store_name") or "Returns"
+    support_email = (cfg.get("support_email") or "").strip() or (cfg.get("from_email") or "")
+    logo_url = cfg.get("logo_url") or ""
+
+    copy = _STATUS_COPY.get(new_status) or {
+        "kicker": "Status update",
+        "kicker_color": "#0A0A0A",
+        "headline": f"Status: {status_label or new_status}",
+        "body": "There's been an update to your return — see the latest status below.",
+    }
+
+    if not tracking_link:
+        tracking_link = _tracking_link(cfg, rma_number)
+
+    cta_block = ""
+    if tracking_link:
+        cta_block = f"""
+          <p style="margin:18px 0">
+            <a href="{tracking_link}"
+               style="display:inline-block;background:#0A0A0A;color:#fff;padding:14px 24px;text-decoration:none;font-weight:500">
+              View live status
+            </a>
+          </p>
+        """
+
+    inner = f"""
+      <div style="text-transform:uppercase;letter-spacing:0.18em;font-size:11px;color:{copy['kicker_color']}">{copy['kicker']}</div>
+      <h1 style="margin:8px 0 16px;font-size:24px;font-weight:500">{copy['headline']}</h1>
+      <p style="margin:0 0 12px;line-height:1.65">{copy['body']}</p>
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #E5E5E0;padding:16px;margin:16px 0;font-family:ui-monospace,Menlo,monospace;font-size:13px">
+        <tr><td style="padding:4px 0;color:#78716C">RMA</td><td align="right">{rma_number}</td></tr>
+        <tr><td style="padding:4px 0;color:#78716C">Order</td><td align="right">#{order_number}</td></tr>
+        <tr><td style="padding:4px 0;color:#78716C">Status</td><td align="right">{status_label or new_status}</td></tr>
+      </table>
+      {cta_block}
+      <p style="margin:14px 0 0;font-size:12px;color:#78716C">
+        You're getting this because you opted in to status updates on the
+        tracking page. To stop these emails, open the tracking page and
+        toggle "Get email updates" off.
+      </p>
+    """
+    html = _base_html(store_name, support_email, logo_url, inner, cfg)
+    subject = f"{store_name} · {copy['kicker']} · {rma_number}"
+    return await send_email(cfg, to_email=to_email, to_name=to_name, subject=subject,
+                            html=html, tags=["status_update", f"status_{new_status}"])

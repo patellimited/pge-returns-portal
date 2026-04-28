@@ -23,7 +23,7 @@ from models import (
     CheckoutRequest, CheckoutResponse, PaymentStatusResponse,
     AdminLoginRequest, AdminLoginResponse, AdminNoteRequest, InternalNoteRequest,
     TrackingResponse, Address, CustomerAction, CustomerActionRequest,
-    RatePreviewRequest, SelfShipTrackingRequest,
+    RatePreviewRequest, SelfShipTrackingRequest, SubscribeStatusRequest,
 )
 import auth as auth_svc
 import woo
@@ -1423,6 +1423,9 @@ async def submit_self_ship_tracking(return_id: str, body: SelfShipTrackingReques
     except Exception as e:
         log.warning("self-ship tracking-added email failed: %s", e)
 
+    # Best-effort: notify subscribed customers that their parcel is now in_transit.
+    await _notify_status_subscriber(doc["rma_number"], "in_transit")
+
     # Best-effort initial Shippo tracking poll for tracked carriers.
     if is_tracked and tracking_number and cfg.get("shippo_api_key"):
         slug = _SELF_SHIP_TRACKING_SLUGS.get(carrier_display)
@@ -1538,9 +1541,18 @@ async def _self_ship_reminder_tick():
                 "tracking_status": tr.get("status"),
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }
+            new_app_status: Optional[str] = None
             if new_status_raw in ("delivered", "delivery"):
                 update["status"] = "delivered"
+                new_app_status = "delivered"
             await db.returns.update_one({"id": doc["id"]}, {"$set": update})
+            # Best-effort customer notification if they opted in.
+            if new_app_status:
+                rma = (await db.returns.find_one(
+                    {"id": doc["id"]}, {"_id": 0, "rma_number": 1}
+                ) or {}).get("rma_number")
+                if rma:
+                    await _notify_status_subscriber(rma, new_app_status)
 
 
 async def _self_ship_loop():
@@ -1575,6 +1587,158 @@ async def _ensure_indexes():
 
 
 # ---- Tracking & Admin Endpoints ----
+
+# Sensible defaults if we don't yet have enough delivered samples for a carrier.
+# Tuned for UK return flows (warehouse in UK).
+_DEFAULT_ETA_DAYS = {
+    "Royal Mail": (2, 3),
+    "Evri": (2, 4),
+    "Hermes": (2, 4),
+    "DPD": (1, 2),
+    "UPS": (1, 3),
+    "FedEx": (1, 3),
+    "Parcelforce": (1, 2),
+}
+_FALLBACK_ETA_DAYS = (2, 5)
+# Re-compute carrier averages at most this often per process — small in-memory
+# cache so the public tracking endpoint stays cheap under traffic.
+_CARRIER_AVG_CACHE: Dict[str, Any] = {"at": None, "data": {}}
+_CARRIER_AVG_TTL_SEC = 600  # 10 minutes
+
+
+async def _carrier_avg_days() -> Dict[str, float]:
+    """Average label_purchased → delivered transit time per carrier, in days,
+    from real delivered returns. Cached for `_CARRIER_AVG_TTL_SEC`."""
+    now = datetime.now(timezone.utc)
+    cached_at = _CARRIER_AVG_CACHE.get("at")
+    if cached_at and (now - cached_at).total_seconds() < _CARRIER_AVG_TTL_SEC:
+        return _CARRIER_AVG_CACHE["data"]
+
+    bucket: Dict[str, List[float]] = {}
+    cursor = db.returns.find(
+        {"status": "delivered", "tracking_carrier": {"$nin": [None, ""]},
+         "archived": {"$ne": True}},
+        {"_id": 0, "tracking_carrier": 1, "customer_actions": 1,
+         "tracking_updates": 1, "created_at": 1, "updated_at": 1},
+    )
+    async for d in cursor:
+        carrier = str(d.get("tracking_carrier") or "").strip()
+        if not carrier:
+            continue
+        lp_iso = None
+        for act in (d.get("customer_actions") or []):
+            kind = (act or {}).get("kind") or ""
+            if kind in ("paid_for_label", "deduct_from_refund_confirmed",
+                        "admin_approved_free_label"):
+                lp_iso = (act or {}).get("at") or lp_iso
+                break
+        if not lp_iso:
+            lp_iso = d.get("created_at")
+        dl_iso = None
+        for u in (d.get("tracking_updates") or []):
+            if str((u or {}).get("status") or "").lower() in ("delivered", "delivery"):
+                dl_iso = (u or {}).get("status_date") or (u or {}).get("at")
+                break
+        if not dl_iso:
+            dl_iso = d.get("updated_at")
+        try:
+            lp = datetime.fromisoformat(str(lp_iso).replace("Z", "+00:00"))
+            dl = datetime.fromisoformat(str(dl_iso).replace("Z", "+00:00"))
+            days = (dl - lp).total_seconds() / 86400.0
+            if 0 < days < 30:
+                bucket.setdefault(carrier, []).append(days)
+        except Exception:
+            continue
+    avg = {c: round(sum(v) / len(v), 1) for c, v in bucket.items()
+           if len(v) >= 3}  # need ≥3 samples to trust an average
+    _CARRIER_AVG_CACHE["at"] = now
+    _CARRIER_AVG_CACHE["data"] = avg
+    return avg
+
+
+def _eta_for_doc(doc: Dict[str, Any], carrier_avgs: Dict[str, float]) -> Dict[str, Any]:
+    """Pick the best ETA window for this return: data-driven if we have
+    enough carrier samples, sensible default otherwise. Returns
+    {min_days, max_days, label, source}. Empty when delivered/refunded."""
+    status = (doc.get("status") or "").lower()
+    if status in ("delivered", "refunded", "store_credit_issued",
+                  "rejected", "cancelled"):
+        return {}
+    carrier = (doc.get("tracking_carrier") or "").strip()
+    avg = carrier_avgs.get(carrier) if carrier else None
+    if avg is not None:
+        # Build a tight window around the average: ±25%, floored at 1 day.
+        lo = max(1, int(round(avg * 0.75)))
+        hi = max(lo + 1, int(round(avg * 1.25)))
+        source = "carrier_average"
+    else:
+        lo, hi = _DEFAULT_ETA_DAYS.get(carrier, _FALLBACK_ETA_DAYS)
+        source = "default" if carrier else "fallback"
+    if lo == hi:
+        label = f"Usually arrives in {lo} business day{'' if lo == 1 else 's'}"
+    else:
+        label = f"Usually arrives in {lo}–{hi} business days"
+    return {"min_days": lo, "max_days": hi, "label": label, "source": source}
+
+
+# Status transitions worth proactively emailing the customer about. Other
+# transitions either already trigger a dedicated email (label_ready,
+# coupon-issued) or aren't customer-visible enough to warrant one.
+_NOTIFY_STATUSES = {"in_transit", "delivered", "refunded",
+                    "store_credit_issued", "approved", "rejected"}
+
+# In-process dedupe so the same status notification can't fire twice within
+# the same minute (handy when the Shippo poll loop double-runs).
+_NOTIFY_DEDUP: Dict[str, datetime] = {}
+
+
+async def _notify_status_subscriber(rma_number: str, new_status: str) -> bool:
+    """Fire a status-update email iff the customer subscribed via the public
+    tracking page. Always fail-safe — never raises."""
+    if not rma_number or new_status not in _NOTIFY_STATUSES:
+        return False
+    dedup_key = f"{rma_number}:{new_status}"
+    now = datetime.now(timezone.utc)
+    last = _NOTIFY_DEDUP.get(dedup_key)
+    if last and (now - last).total_seconds() < 60:
+        return False
+    _NOTIFY_DEDUP[dedup_key] = now
+    try:
+        doc = await db.returns.find_one(
+            {"rma_number": rma_number},
+            {"_id": 0, "rma_number": 1, "order_number": 1, "email": 1,
+             "customer_name": 1, "notify_status_email": 1,
+             "notify_status_email_address": 1},
+        )
+        if not doc or not doc.get("notify_status_email"):
+            return False
+        to_email = (doc.get("notify_status_email_address")
+                    or doc.get("email") or "").strip()
+        if not to_email:
+            return False
+        cfg = await settings_service.get_settings(db)
+        from models import ReturnStatus  # avoid heavy top-of-file circular
+        try:
+            label = ReturnStatus(new_status).value if hasattr(ReturnStatus, '__members__') else new_status
+        except Exception:
+            label = new_status
+        # Use STATUS_LABELS from frontend? No — we don't have a Python copy.
+        # Stick with the raw status_label and let the email template handle copy.
+        await email_service.send_status_update(
+            cfg, to_email=to_email,
+            to_name=doc.get("customer_name") or "",
+            rma_number=doc["rma_number"],
+            order_number=doc.get("order_number") or "",
+            new_status=new_status,
+            status_label=label,
+        )
+        return True
+    except Exception as e:
+        log.warning("status-update notify failed (rma=%s, status=%s): %s",
+                    rma_number, new_status, e)
+        return False
+
+
 @api.get("/tracking/{identifier}", response_model=TrackingResponse)
 async def track_return(identifier: str):
     ident = (identifier or "").strip()
@@ -1600,7 +1764,75 @@ async def track_return(identifier: str):
     # Map `tracking_updates` -> `updates` since the public model field name differs
     if "tracking_updates" in doc and "updates" not in doc:
         doc["updates"] = doc.get("tracking_updates") or []
+    # Smart ETA window — only included while the parcel is in flight.
+    try:
+        avgs = await _carrier_avg_days()
+        eta = _eta_for_doc(doc, avgs)
+        if eta:
+            doc["eta_min_days"] = eta["min_days"]
+            doc["eta_max_days"] = eta["max_days"]
+            doc["eta_label"] = eta["label"]
+            doc["eta_source"] = eta["source"]
+    except Exception as e:
+        log.info("eta calc skipped: %s", e)
+    # Surface current subscription state so the frontend toggle reflects DB truth.
+    doc["notify_status_email"] = bool(doc.get("notify_status_email"))
     return TrackingResponse(**doc)
+
+
+@api.post("/tracking/{identifier}/subscribe")
+async def subscribe_status_updates(identifier: str, body: SubscribeStatusRequest):
+    """Customer-facing toggle: opt in / out of email-on-status-change.
+
+    Looks the return up the same way as `GET /tracking/{identifier}` (RMA,
+    tracking number, self-ship tracking, or order number). When `enabled`
+    is True we store the customer-supplied email (or fall back to the order
+    email). When False we just clear the flag — the email stays on the doc
+    so re-enabling later is one click.
+    """
+    ident = (identifier or "").strip()
+    ident_no_hash = ident.lstrip("#")
+    doc = await db.returns.find_one(
+        {"$or": [{"rma_number": ident.upper()},
+                 {"tracking_number": ident},
+                 {"self_ship_tracking_number": ident}]},
+        {"_id": 0, "id": 1, "rma_number": 1, "email": 1,
+         "notify_status_email": 1, "notify_status_email_address": 1},
+    )
+    if not doc and ident_no_hash:
+        doc = await db.returns.find_one(
+            {"order_number": ident_no_hash},
+            {"_id": 0, "id": 1, "rma_number": 1, "email": 1,
+             "notify_status_email": 1, "notify_status_email_address": 1},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
+    if not doc:
+        raise HTTPException(status_code=404, detail="No return found.")
+
+    update_set: Dict[str, Any] = {
+        "notify_status_email": bool(body.enabled),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if body.enabled:
+        # Light-touch validation: must look like an email if provided. Falls
+        # back to the order's email if blank (most common case).
+        chosen = (body.email or "").strip() or (doc.get("email") or "").strip()
+        if not chosen or "@" not in chosen or "." not in chosen.split("@")[-1]:
+            raise HTTPException(status_code=400,
+                                detail="Please enter a valid email address.")
+        update_set["notify_status_email_address"] = chosen
+    await db.returns.update_one({"id": doc["id"]}, {"$set": update_set})
+
+    return {
+        "ok": True,
+        "rma_number": doc["rma_number"],
+        "notify_status_email": update_set["notify_status_email"],
+        "notify_status_email_address": update_set.get(
+            "notify_status_email_address",
+            doc.get("notify_status_email_address") or "",
+        ),
+    }
+
 
 @api.post("/auth/login", response_model=AdminLoginResponse)
 async def admin_login(body: AdminLoginRequest, request: Request):
@@ -2529,6 +2761,12 @@ async def mark_refunded(return_id: str, user=Depends(auth_svc.require_admin)):
                   "closed": True, "closed_reason": "refunded", "closed_at": now,
                   "updated_at": now}}
     )
+    # Best-effort customer notification if they subscribed to status updates.
+    rma = (await db.returns.find_one(
+        {"id": return_id}, {"_id": 0, "rma_number": 1}
+    ) or {}).get("rma_number")
+    if rma:
+        await _notify_status_subscriber(rma, "refunded")
     return {"status": "refunded"}
 
 @api.post("/admin/returns/{return_id}/notes")

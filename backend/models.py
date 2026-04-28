@@ -303,9 +303,19 @@ class TrackingResponse(BaseModel):
     self_ship_tracking_number: Optional[str] = None
     self_ship_is_tracked: Optional[bool] = None
     self_ship_submitted_at: Optional[str] = None
+    # Smart-tracking extras (computed at request time, not stored on the doc)
+    eta_min_days: Optional[int] = None
+    eta_max_days: Optional[int] = None
+    eta_label: Optional[str] = None        # e.g. "Usually arrives in 2–3 business days"
+    eta_source: Optional[str] = None       # "carrier_average" | "default" | "delivered"
+    notify_status_email: Optional[bool] = None
+    notify_status_email_address: Optional[str] = None
 
 
-class SelfShipTrackingRequest(BaseModel):
+class SubscribeStatusRequest(BaseModel):
+    """Customer toggle for "email me on status change" on the tracking page."""
+    enabled: bool
+    email: Optional[str] = None
     """Customer-submitted tracking info for a self-ship return."""
     carrier: str  # one of: Royal Mail / Evri / DPD / UPS / FedEx / Other
     carrier_other: Optional[str] = ""  # free text when carrier == "Other"

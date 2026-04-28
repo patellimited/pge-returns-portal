@@ -8,6 +8,8 @@ import {
   Package,
   Info,
   MagnifyingGlass,
+  Clock,
+  BellRinging,
 } from "@phosphor-icons/react";
 import { toast } from "sonner";
 import SelfShipPanel from "../components/SelfShipPanel";
@@ -67,6 +69,51 @@ export default function TrackReturn() {
   const currentIdx = data ? Math.max(0, ORDER.indexOf(data.status)) : -1;
   const lastUpdated = useMemo(() => timeAgo(data?.updated_at), [data]);
   const itemsCount = data?.items?.length || 0;
+  const hasEta = !!data?.eta_label && currentIdx < 2; // hide once delivered/refunded
+
+  // ---- "Get email updates" subscription state -------------------------------
+  const [subscribing, setSubscribing] = useState(false);
+  const [subscribed, setSubscribed] = useState(false);
+  const [subEmail, setSubEmail] = useState("");
+  const [showSubEmailInput, setShowSubEmailInput] = useState(false);
+
+  // Sync local toggle state whenever a fresh tracking payload lands.
+  useEffect(() => {
+    if (data) {
+      setSubscribed(!!data.notify_status_email);
+      setSubEmail(
+        data.notify_status_email_address || data.email || ""
+      );
+    }
+  }, [data]);
+
+  const toggleSubscribe = async (next) => {
+    if (!data?.rma_number) return;
+    // Turning ON without an email on file → reveal a tiny inline input.
+    if (next && !(data.email || subEmail)) {
+      setShowSubEmailInput(true);
+      return;
+    }
+    setSubscribing(true);
+    try {
+      const r = await api.post(
+        `/tracking/${encodeURIComponent(data.rma_number)}/subscribe`,
+        { enabled: next, email: subEmail || data.email || undefined }
+      );
+      setSubscribed(!!r.data.notify_status_email);
+      setSubEmail(r.data.notify_status_email_address || subEmail);
+      setShowSubEmailInput(false);
+      toast.success(
+        next
+          ? "You'll get an email every time the status changes."
+          : "Email updates turned off."
+      );
+    } catch (e) {
+      toast.error(e.response?.data?.detail || "Couldn't update preference.");
+    } finally {
+      setSubscribing(false);
+    }
+  };
 
   return (
     <div className="min-h-screen bg-white fade-in" data-testid="track-page">
@@ -176,6 +223,20 @@ export default function TrackReturn() {
                   <Package size={12} /> {itemsCount} item{itemsCount === 1 ? "" : "s"}
                 </span>
               )}
+              {hasEta && (
+                <span
+                  className="inline-flex items-center gap-1 px-2.5 py-1 border border-[hsl(var(--ink))] bg-white text-[hsl(var(--ink))]"
+                  style={{ borderRadius: 2 }}
+                  data-testid="track-eta-chip"
+                  title={
+                    data.eta_source === "carrier_average"
+                      ? "Estimated from real delivery times for this carrier"
+                      : "Typical carrier estimate"
+                  }
+                >
+                  <Clock size={12} /> {data.eta_label}
+                </span>
+              )}
               {lastUpdated && (
                 <span
                   className="inline-flex items-center gap-1 px-2.5 py-1 border border-[hsl(var(--border))] bg-[hsl(var(--surface))] text-[hsl(var(--ink-muted))]"
@@ -248,6 +309,87 @@ export default function TrackReturn() {
                   </div>
                 );
               })}
+            </div>
+
+            {/* Get email updates toggle */}
+            <div
+              className="mt-6 p-4 border border-[hsl(var(--border))] bg-[hsl(var(--surface))]"
+              style={{ borderRadius: 2 }}
+              data-testid="track-subscribe-card"
+            >
+              <div className="flex items-start sm:items-center justify-between gap-4 flex-col sm:flex-row">
+                <div className="flex items-start gap-3">
+                  <BellRinging
+                    size={18}
+                    weight={subscribed ? "fill" : "regular"}
+                    className={
+                      subscribed
+                        ? "text-[hsl(var(--ink))] mt-0.5 sm:mt-0"
+                        : "text-[hsl(var(--ink-muted))] mt-0.5 sm:mt-0"
+                    }
+                  />
+                  <div>
+                    <div className="text-sm font-medium text-[hsl(var(--ink))]">
+                      Get email updates
+                    </div>
+                    <div className="text-xs text-[hsl(var(--ink-muted))] mt-0.5">
+                      We'll email{" "}
+                      <span className="mono">
+                        {subEmail || data.email || "you"}
+                      </span>{" "}
+                      whenever your status changes — no need to check back.
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={subscribed}
+                  disabled={subscribing}
+                  onClick={() => toggleSubscribe(!subscribed)}
+                  className="relative inline-flex h-7 w-12 items-center transition-colors disabled:opacity-50"
+                  style={{
+                    background: subscribed
+                      ? "hsl(var(--ink))"
+                      : "hsl(var(--border))",
+                    borderRadius: 999,
+                  }}
+                  data-testid="track-subscribe-toggle"
+                >
+                  <span
+                    className="inline-block h-5 w-5 bg-white transition-transform"
+                    style={{
+                      borderRadius: 999,
+                      transform: subscribed
+                        ? "translateX(22px)"
+                        : "translateX(4px)",
+                    }}
+                  />
+                </button>
+              </div>
+              {showSubEmailInput && (
+                <div
+                  className="mt-3 flex flex-col sm:flex-row gap-2"
+                  data-testid="track-subscribe-email-row"
+                >
+                  <input
+                    type="email"
+                    className="input-field flex-1"
+                    placeholder="you@example.com"
+                    value={subEmail}
+                    onChange={(e) => setSubEmail(e.target.value)}
+                    data-testid="track-subscribe-email-input"
+                  />
+                  <button
+                    className="btn-primary w-full sm:w-auto"
+                    disabled={subscribing || !subEmail}
+                    onClick={() => toggleSubscribe(true)}
+                    data-testid="track-subscribe-confirm"
+                  >
+                    {subscribing ? "Saving…" : "Subscribe"}
+                  </button>
+                </div>
+              )}
             </div>
 
             {data.updates?.length > 0 && (
