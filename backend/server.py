@@ -1577,12 +1577,24 @@ async def _ensure_indexes():
 # ---- Tracking & Admin Endpoints ----
 @api.get("/tracking/{identifier}", response_model=TrackingResponse)
 async def track_return(identifier: str):
+    ident = (identifier or "").strip()
+    # Accept order numbers entered with a leading "#" (common copy-paste from emails)
+    ident_no_hash = ident.lstrip("#")
     doc = await db.returns.find_one(
-        {"$or": [{"rma_number": identifier.upper()},
-                 {"tracking_number": identifier},
-                 {"self_ship_tracking_number": identifier}]},
+        {"$or": [{"rma_number": ident.upper()},
+                 {"tracking_number": ident},
+                 {"self_ship_tracking_number": ident}]},
         {"_id": 0},
     )
+    # Fallback: allow lookup by order number. If multiple returns exist for
+    # the same order, surface the most recently updated one so the customer
+    # always lands on the active return.
+    if not doc and ident_no_hash:
+        doc = await db.returns.find_one(
+            {"order_number": ident_no_hash},
+            {"_id": 0},
+            sort=[("updated_at", -1), ("created_at", -1)],
+        )
     if not doc:
         raise HTTPException(status_code=404, detail="No return found.")
     # Map `tracking_updates` -> `updates` since the public model field name differs

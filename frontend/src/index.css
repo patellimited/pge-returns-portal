@@ -81,8 +81,24 @@
   @apply inline-flex items-center justify-center h-12 px-7 text-sm font-medium bg-transparent text-[hsl(var(--ink))] border border-[hsl(var(--border))] transition-all duration-200 hover:border-[hsl(var(--ink))];
 }
 .input-field {
-  @apply h-14 w-full px-4 text-base border border-[hsl(var(--border))] bg-white transition-colors focus:outline-none focus:ring-0 focus:border-[hsl(var(--ink))];
+  @apply h-14 w-full px-4 border border-[hsl(var(--border))] bg-white transition-colors focus:outline-none focus:ring-0 focus:border-[hsl(var(--ink))];
+  /* Reset iOS / Android browser chrome so the field renders flat on every device */
+  -webkit-appearance: none;
+  -moz-appearance: none;
+  appearance: none;
   border-radius: 2px;
+  /* 16px+ prevents iOS Safari from zooming the page on focus */
+  font-size: 16px;
+  line-height: 1.4;
+  color: hsl(var(--ink));
+  box-shadow: none;
+}
+.input-field::placeholder {
+  color: hsl(var(--ink-muted));
+  opacity: 1;
+}
+.input-field:focus {
+  box-shadow: 0 0 0 1px hsl(var(--ink));
 }
 .card-flat {
   @apply border border-[hsl(var(--border))] bg-white p-6 lg:p-8;
