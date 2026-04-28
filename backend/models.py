@@ -316,6 +316,9 @@ class SubscribeStatusRequest(BaseModel):
     """Customer toggle for "email me on status change" on the tracking page."""
     enabled: bool
     email: Optional[str] = None
+
+
+class SelfShipTrackingRequest(BaseModel):
     """Customer-submitted tracking info for a self-ship return."""
     carrier: str  # one of: Royal Mail / Evri / DPD / UPS / FedEx / Other
     carrier_other: Optional[str] = ""  # free text when carrier == "Other"
