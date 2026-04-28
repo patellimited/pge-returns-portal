@@ -3,8 +3,21 @@
 Values are stored in MongoDB (`app_settings` collection, single doc id="config").
 Any key missing from DB falls back to the corresponding env var.
 Admin can update any of these from the dashboard without redeploy.
+
+Performance note
+----------------
+Settings are read on almost every request (logo on `/branding`, API keys on
+order lookup, label purchase, email send, etc.). To avoid a Mongo round-trip
+per request we keep an in-process cache of the merged settings dict, refreshed
+lazily after `_TTL_SECONDS` (safety net for multi-worker drift) and eagerly
+invalidated whenever the admin saves new values via `update_settings()`.
+
+The cache is per-process — fine for our single-worker Render setup. If you
+later scale to multiple workers, swap `invalidate_cache()` to push a Redis
+pub/sub message so every worker drops its local copy.
 """
 import os
+import time
 from typing import Dict, Any, Optional
 
 SETTINGS_KEYS = [
@@ -111,8 +124,28 @@ CODE_DEFAULTS = {
 }
 
 
+# In-process cache for the merged settings dict. Populated lazily on first
+# read, wiped on every admin write via `invalidate_cache()`. The TTL is a
+# safety net (multi-worker drift, manual Mongo edits) — admin UI changes
+# are visible instantly because they go through `update_settings()`.
+_CACHE: Dict[str, Any] = {"data": None, "at": None}
+_TTL_SECONDS: float = 60.0
+
+
 async def get_settings(db) -> Dict[str, str]:
-    """Return merged settings: MongoDB values overlaid on env defaults (then code defaults)."""
+    """Return merged settings: MongoDB values overlaid on env defaults (then code defaults).
+
+    Served from the in-process cache when fresh (`_TTL_SECONDS`). The cache
+    is invalidated on every `update_settings()` call, so admin edits show up
+    immediately — the TTL is just a safety net against drift.
+    """
+    now = time.monotonic()
+    cached = _CACHE.get("data")
+    cached_at = _CACHE.get("at") or 0.0
+    if cached is not None and (now - cached_at) < _TTL_SECONDS:
+        # Return a shallow copy so callers can't mutate the cached dict.
+        return dict(cached)
+
     doc = await db.app_settings.find_one({"_id": "config"}) or {}
     out: Dict[str, str] = {}
     for k in SETTINGS_KEYS:
@@ -122,7 +155,16 @@ async def get_settings(db) -> Dict[str, str]:
         if not val:
             val = CODE_DEFAULTS.get(k, "")
         out[k] = val or ""
-    return out
+    _CACHE["data"] = out
+    _CACHE["at"] = now
+    return dict(out)
+
+
+def invalidate_cache() -> None:
+    """Drop the in-memory cache — next `get_settings()` call will re-query Mongo.
+    Called automatically by `update_settings()`; exposed for tests / manual flush."""
+    _CACHE["data"] = None
+    _CACHE["at"] = None
 
 
 async def update_settings(db, updates: Dict[str, Any]) -> Dict[str, str]:
@@ -154,6 +196,9 @@ async def update_settings(db, updates: Dict[str, Any]) -> Dict[str, str]:
         await db.app_settings.update_one(
             {"_id": "config"}, {"$set": clean}, upsert=True
         )
+    # Invalidate so the next get_settings() rebuilds the cache from the
+    # freshly-saved doc — no stale logo / API keys after an admin edit.
+    invalidate_cache()
     return await get_settings(db)
 
 
