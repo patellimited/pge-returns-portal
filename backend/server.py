@@ -1739,26 +1739,68 @@ async def _notify_status_subscriber(rma_number: str, new_status: str) -> bool:
         return False
 
 
-@api.get("/tracking/{identifier}", response_model=TrackingResponse)
-async def track_return(identifier: str):
-    ident = (identifier or "").strip()
-    # Accept order numbers entered with a leading "#" (common copy-paste from emails)
-    ident_no_hash = ident.lstrip("#")
+async def _find_return_by_identifier(
+    identifier: str,
+    projection: Optional[Dict[str, int]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Public-facing return lookup — used by `/tracking/{identifier}` and the
+    subscribe endpoint. Resolves the customer's input against, in order:
+
+    1. RMA number (case-insensitive, e.g. "rma-123abc" → "RMA-123ABC")
+    2. Carrier tracking number on the purchased label
+    3. Self-ship tracking number the customer pasted
+    4. Order number (the human-friendly invoice number from WooCommerce)
+    5. Order ID (the internal numeric Woo ID — some customers paste this
+       instead of the display number)
+
+    Steps 4 + 5 also try integer comparisons because historic returns may
+    have stored these fields as int rather than str. When several returns
+    share the same order, we surface the most recently updated one so the
+    customer lands on the active return — this is the right call for
+    repeat-return orders (e.g. someone returns more items from the same
+    order a week later) and for any return method (refund, store credit,
+    self-ship — method is irrelevant to lookup).
+    """
+    if not identifier:
+        return None
+    ident = identifier.strip()
+    if not ident:
+        return None
+    no_hash = ident.lstrip("#").strip()
+    proj = projection if projection is not None else {"_id": 0}
+
+    # Pass 1: exact identifier (RMA / tracking)
     doc = await db.returns.find_one(
         {"$or": [{"rma_number": ident.upper()},
                  {"tracking_number": ident},
                  {"self_ship_tracking_number": ident}]},
-        {"_id": 0},
+        proj,
     )
-    # Fallback: allow lookup by order number. If multiple returns exist for
-    # the same order, surface the most recently updated one so the customer
-    # always lands on the active return.
-    if not doc and ident_no_hash:
-        doc = await db.returns.find_one(
-            {"order_number": ident_no_hash},
-            {"_id": 0},
-            sort=[("updated_at", -1), ("created_at", -1)],
-        )
+    if doc:
+        return doc
+
+    # Pass 2: order number / order ID, type-agnostic.
+    if not no_hash:
+        return None
+    or_clauses: List[Dict[str, Any]] = [
+        {"order_number": no_hash},
+        {"order_id": no_hash},
+    ]
+    try:
+        as_int = int(no_hash)
+        or_clauses.extend([{"order_number": as_int}, {"order_id": as_int}])
+    except (TypeError, ValueError):
+        pass
+    return await db.returns.find_one(
+        {"$or": or_clauses},
+        proj,
+        sort=[("updated_at", -1), ("created_at", -1)],
+    )
+
+
+@api.get("/tracking/{identifier}", response_model=TrackingResponse)
+async def track_return(identifier: str):
+    doc = await _find_return_by_identifier(identifier, projection={"_id": 0})
     if not doc:
         raise HTTPException(status_code=404, detail="No return found.")
     # Map `tracking_updates` -> `updates` since the public model field name differs
@@ -1785,27 +1827,16 @@ async def subscribe_status_updates(identifier: str, body: SubscribeStatusRequest
     """Customer-facing toggle: opt in / out of email-on-status-change.
 
     Looks the return up the same way as `GET /tracking/{identifier}` (RMA,
-    tracking number, self-ship tracking, or order number). When `enabled`
-    is True we store the customer-supplied email (or fall back to the order
-    email). When False we just clear the flag — the email stays on the doc
-    so re-enabling later is one click.
+    tracking number, self-ship tracking, order number, or order ID). When
+    `enabled` is True we store the customer-supplied email (or fall back to
+    the order email). When False we just clear the flag — the email stays
+    on the doc so re-enabling later is one click.
     """
-    ident = (identifier or "").strip()
-    ident_no_hash = ident.lstrip("#")
-    doc = await db.returns.find_one(
-        {"$or": [{"rma_number": ident.upper()},
-                 {"tracking_number": ident},
-                 {"self_ship_tracking_number": ident}]},
-        {"_id": 0, "id": 1, "rma_number": 1, "email": 1,
-         "notify_status_email": 1, "notify_status_email_address": 1},
+    doc = await _find_return_by_identifier(
+        identifier,
+        projection={"_id": 0, "id": 1, "rma_number": 1, "email": 1,
+                    "notify_status_email": 1, "notify_status_email_address": 1},
     )
-    if not doc and ident_no_hash:
-        doc = await db.returns.find_one(
-            {"order_number": ident_no_hash},
-            {"_id": 0, "id": 1, "rma_number": 1, "email": 1,
-             "notify_status_email": 1, "notify_status_email_address": 1},
-            sort=[("updated_at", -1), ("created_at", -1)],
-        )
     if not doc:
         raise HTTPException(status_code=404, detail="No return found.")
 
