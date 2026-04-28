@@ -1,0 +1,38 @@
+{
+  "summary": "Backend bug-fix bundle (iter6) for PGE Returns Portal — 27/27 tests pass. Validated auth/JWT, /api/branding & /api/stats/public, two-stage approve-free for store_credit (free_label vs self_ship), bonus + label-deduction coupon math (verified end-to-end with monkey-patched woo.create_coupon), revoke-store-credit flow (no longer triggers admin_label_failure email), internal-notes endpoint (auth, 404, 400, 200, timestamp + author + persistence of multiple notes), CreateReturnRequest schema accepts new optional restricted_shipping_choice, and email_service module imports cleanly with all new helpers (_email_footer_html, _tracking_link, _smart_post_arrival_line, send_store_credit_revoked_to_customer).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/admin/returns/{id}/revoke-store-credit", "issue": "On 2nd call after status flips to 'rejected', endpoint returns 400 ('no active store-credit coupon to revoke') rather than the documented 'already_revoked: true' shortcut. The store_credit_revoked early-return path (line ~2450) is unreachable because status is overwritten to 'rejected' on first call. Behaviour is still safe (idempotent in spirit — no double action), but the contract advertised in the docstring is misleading."},
+      {"endpoint": "approve-free / store_credit financial stage", "issue": "When woo.create_coupon fails (no WC creds), the endpoint returns 502 with detail 'Store credit could not be issued.' but does NOT advance the status. Fine for test envs, but in production a transient WC outage means the admin must retry manually — consider queueing a retry."},
+      {"endpoint": "FastAPI startup/shutdown", "issue": "Uses deprecated @app.on_event('startup'/'shutdown'). Should migrate to lifespan handlers (FastAPI 0.110+)."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iter6_bug_bundle.py",
+    "/app/test_reports/pytest/iter6_results.xml"
+  ],
+  "action_items": [
+    "(Minor) Settings collection uses _id='config' (per settings_service.py line 103) — confirm any internal docs/admin tools that reference _id='main' are updated.",
+    "(Minor) revoke-store-credit's 'already_revoked' shortcut is unreachable because status flips to 'rejected' on first call. Either keep status as 'store_credit_issued' + flag-only, or make the 400 message say 'already revoked' when store_credit_revoked is True.",
+    "(Nit) Migrate @app.on_event to FastAPI lifespan handlers."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 2509 lines — exceeds the 700-line guideline. Split into routers (admin_returns.py, returns.py, public.py, settings.py, etc.).",
+    "Two-stage approve-free logic in approve_free_return is correct but dense (~150 lines of branching). Consider extracting the 4 sub-flows (financial-stage, self_ship stage-1, free_label stage-1, default non-store-credit) into named helpers for testability.",
+    "_issue_store_credit_for_return correctly applies bonus to FULL refund subtotal then subtracts label_deduction — formula verified: round(base + round(base * bonus_pct/100, 2) - refund_deduction, 2). It uses doc.refund_deduction (NOT coupon_label_deduction) as the input deduction; the saved field coupon_label_deduction is set to the same value for audit. That's intentional but worth a comment.",
+    "/api/stats/public counts statuses ['refunded', 'store_credit_issued', 'delivered']. 'delivered' may overcount if the return has not been finalised yet — consider filtering closed=true OR removing 'delivered'.",
+    "InternalNoteRequest validates length≤5000 chars and trims whitespace — good. Author is taken from JWT.sub which currently returns email — confirm middleware sets sub to the admin email not just 'admin'.",
+    "revoke-store-credit correctly stops calling send_admin_label_failure (the bug) and instead calls send_store_credit_revoked_to_customer — fix verified."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iter6_bug_bundle.py (new)"
+  ],
+  "success_rate": {"backend": "100% (27/27)", "frontend": "n/a (skipped per request)"},
+  "test_credentials": "admin@pgelimited.com / admin123 (from /app/memory/test_credentials.md)",
+  "seed_data_creation": "Tests insert TEST-prefixed return docs directly into MongoDB (returns collection) and clean them up after each test via the seed_return fixture. app_settings doc with _id='config' is upserted with store_credit_bonus_percent and enable_store_credit for math tests — value left at the test's last set value (5%) but does not affect production data.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Frontend was explicitly NOT tested in this iteration. test_iter6_bug_bundle.py is the single source of truth for iter6 backend regression — 27 tests, runs in ~4s. Settings collection uses _id='config' (NOT 'main'). For tests requiring a return doc, use the seed_return fixture which auto-cleans. Stage-2 coupon issuance is exercised end-to-end via a monkey-patched server.woo.create_coupon (single-asyncio-run loop to avoid motor 'Event loop is closed' across parametrize). Earlier iter3-5 test files exist at /app/backend/tests/test_iter*_*.py and were left untouched — they may have stale expectations after this bug bundle, run them and reconcile if needed."
+}

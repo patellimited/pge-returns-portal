@@ -1,0 +1,366 @@
+--- /tmp/diff_src/backend/server.py	2026-04-23 01:14:23.745481805 +0000
++++ /app/backend/server.py	2026-04-23 01:08:50.121482716 +0000
+@@ -437,18 +437,11 @@
+     await db.returns.insert_one(dict(doc))
+     doc.pop("_id", None)
+ 
+-    # Auto-issue coupon for store_credit returns that do NOT need manual
+-    # review. Manual-review store_credit returns wait for admin approval and
+-    # the coupon is issued from the approve endpoint instead.
+-    if effective_method == "store_credit" and not any(
+-        i.reason in MANUAL_REVIEW_REASONS for i in body.items
+-    ):
+-        try:
+-            updated = await _issue_store_credit_for_return(doc["id"])
+-            if updated:
+-                doc = updated
+-        except Exception as e:
+-            log.warning("auto store-credit issuance failed: %s", e)
++    # Auto-issue coupon for store_credit returns is NO LONGER done at creation
++    # time. All store_credit returns now wait for admin to physically receive
++    # the parcel and click "Approve & issue store credit" on the dashboard —
++    # this closes the "keep item + spend voucher" abuse hole. The coupon is
++    # issued from /admin/returns/{id}/approve-free (the existing admin button).
+ 
+     # Emails are NOT sent here anymore — they all fire from the success page
+     # via POST /returns/{id}/finalize so the customer receives one clean batch
+@@ -1281,7 +1274,14 @@
+     except (TypeError, ValueError):
+         expiry_days = 365
+ 
+-    base_refund = float(doc.get("refund_amount") or 0.0)
++    # Use refund_net (= refund_amount minus any label cost the customer
++    # chose to deduct). Falls back to refund_amount when no deduction was
++    # applied — refund_net is initialised equal to refund_amount on create.
++    base_refund = float(
++        doc.get("refund_net")
++        if doc.get("refund_net") is not None
++        else doc.get("refund_amount") or 0.0
++    )
+     if base_refund <= 0:
+         log.warning("refund_amount is zero for %s, cannot issue store credit", return_id)
+         return None
+@@ -1926,6 +1926,69 @@
+     )
+     return {"status": "note_added"}
+ 
++
++@api.post("/admin/returns/{return_id}/revoke-store-credit")
++async def revoke_store_credit(return_id: str, user=Depends(auth_svc.require_admin)):
++    """Revoke a previously-issued store-credit coupon (e.g. parcel arrived
++    empty, damaged, or wrong item). Expires the coupon in WooCommerce so it
++    can no longer be redeemed, flips the return status, logs the action, and
++    best-effort emails the customer. Idempotent — safe to call twice."""
++    doc = await db.returns.find_one({"id": return_id}, {"_id": 0})
++    if not doc:
++        raise HTTPException(status_code=404, detail="Return not found")
++    if doc.get("status") != "store_credit_issued" or not doc.get("coupon_code"):
++        raise HTTPException(
++            status_code=400,
++            detail="This return has no active store-credit coupon to revoke.",
++        )
++    if doc.get("store_credit_revoked"):
++        return {"status": "store_credit_revoked", "already_revoked": True}
++
++    cfg = await settings_service.get_settings(db)
++    deactivated = await woo.deactivate_coupon(cfg, code=doc["coupon_code"])
++    now = datetime.now(timezone.utc).isoformat()
++    action = CustomerAction(
++        kind="store_credit_revoked",
++        label=f"Store credit revoked: {doc['coupon_code']} · "
++              f"{'deactivated in WooCommerce' if deactivated else 'WooCommerce update failed — please expire manually'}",
++        meta={"code": doc["coupon_code"], "deactivated_in_woo": bool(deactivated)},
++    ).model_dump()
++    await db.returns.update_one(
++        {"id": return_id},
++        {"$set": {
++            "store_credit_revoked": True,
++            "store_credit_revoked_at": now,
++            "store_credit_revoked_in_woo": bool(deactivated),
++            "status": "rejected",
++            "closed": True,
++            "closed_reason": "store_credit_revoked",
++            "closed_at": now,
++            "updated_at": now,
++        },
++         "$push": {"customer_actions": action}},
++    )
++    # Best-effort customer email. Non-blocking.
++    try:
++        await email_service.send_admin_label_failure(
++            cfg,
++            rma_number=doc.get("rma_number", ""),
++            return_id=return_id,
++            error_message="Store credit revoked — parcel arrived empty, damaged, or wrong item.",
++            method_display_label="Store credit (revoked)",
++            amount=float(doc.get("coupon_amount") or 0.0),
++            currency=(doc.get("coupon_currency") or "GBP").upper(),
++            customer_name=(doc.get("return_address") or {}).get("name", ""),
++            customer_email=doc.get("email", ""),
++            rate_provider="",
++            rate_servicelevel="",
++        )
++    except Exception as e:
++        log.warning("revoke-store-credit notification failed: %s", e)
++
++    return {"status": "store_credit_revoked",
++            "deactivated_in_woo": bool(deactivated),
++            "coupon_code": doc["coupon_code"]}
++
+ # =============== APP WIRING ===============
+ app.include_router(api)
+ app.add_middleware(
+--- /tmp/diff_src/backend/woo.py	2026-04-23 01:14:23.745481805 +0000
++++ /app/backend/woo.py	2026-04-23 01:09:07.343482668 +0000
+@@ -290,3 +290,60 @@
+         return None
+     except Exception:
+         return None
++
++
++async def deactivate_coupon(cfg: Dict[str, str], *, code: str) -> bool:
++    """Deactivate a WooCommerce coupon by setting its expiry to yesterday.
++
++    Returns True on success, False on any failure (including the coupon not
++    being found). Safe to call multiple times. Used by the admin "Revoke
++    store credit" button when a parcel arrives empty/damaged and the coupon
++    should no longer be redeemable.
++    """
++    store = (cfg.get("wc_store_url") or "").rstrip("/")
++    key = cfg.get("wc_consumer_key") or ""
++    secret = cfg.get("wc_consumer_secret") or ""
++    if not store or not key or not secret or not code:
++        return False
++
++    # 1) Look up the coupon by code to get its id.
++    try:
++        async with httpx.AsyncClient(timeout=20.0) as client:
++            r = await client.get(
++                f"{store}/wp-json/wc/v3/coupons",
++                auth=(key, secret),
++                params={"code": code},
++            )
++        if r.status_code != 200:
++            return False
++        rows = r.json() or []
++        if not rows:
++            return False
++        coupon_id = rows[0].get("id")
++        if not coupon_id:
++            return False
++    except Exception:
++        return False
++
++    # 2) Expire it. We set both `date_expires` (yesterday) and `usage_limit`
++    #    to whatever it's already used — this stops any further redemptions.
++    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
++    yesterday = (_dt.now(_tz.utc) - _td(days=1)).date().isoformat()
++    try:
++        async with httpx.AsyncClient(timeout=20.0) as client:
++            r = await client.put(
++                f"{store}/wp-json/wc/v3/coupons/{coupon_id}",
++                auth=(key, secret),
++                json={
++                    "date_expires": yesterday,
++                    # Also set usage_limit to its current usage_count so if
++                    # the coupon has already been used once, it can't be
++                    # redeemed again, and if it hasn't, it's capped at 0.
++                    "usage_limit": int(rows[0].get("usage_count") or 0),
++                    "description": (rows[0].get("description") or "")
++                                   + " [REVOKED]",
++                },
++            )
++        return r.status_code in (200, 201)
++    except Exception:
++        return False
+--- /tmp/diff_src/frontend_pages/AdminDashboard.jsx	2026-04-23 01:14:23.751481805 +0000
++++ /app/frontend/src/pages/AdminDashboard.jsx	2026-04-23 01:11:20.564482295 +0000
+@@ -447,11 +447,44 @@
+                     </button>
+                   </>
+                 )}
++                {/* For store_credit returns where the customer already paid
++                    for a label (status=label_purchased / in_transit / delivered),
++                    admin uses the same approve endpoint to mark-received &
++                    issue the coupon once the parcel physically arrives. */}
++                {selected.method === "store_credit"
++                  && !selected.coupon_code
++                  && ["label_purchased", "in_transit", "delivered", "approved"].includes(selected.status) && (
++                    <button
++                      className="btn-primary sm:col-span-2"
++                      onClick={() => setActionModal({ mode: "approve", returnId: selected.id, rma: selected.rma_number, email: selected.email })}
++                      data-testid="mark-received-store-credit-btn"
++                    >
++                      <CheckCircle size={16} className="mr-2" weight="fill" />
++                      Parcel received — issue store credit
++                    </button>
++                  )}
+                 {selected.status !== "refunded" && selected.status !== "rejected" && (
+                   <button className="btn-primary sm:col-span-2" onClick={() => doAction(selected.id, "/mark-refunded", "Marked refunded")} data-testid="mark-refunded-btn">
+                     Mark refunded (in WooCommerce manually)
+                   </button>
+                 )}
++                {selected.status === "store_credit_issued" && !selected.store_credit_revoked && (
++                  <button
++                    className="btn-secondary sm:col-span-2 border-[hsl(var(--destructive))] text-[hsl(var(--destructive))]"
++                    onClick={() => {
++                      if (!window.confirm(
++                        `Revoke store credit ${selected.coupon_code || ""}?\n\n` +
++                        `This expires the coupon in WooCommerce so it can no longer be redeemed. ` +
++                        `Use this if the returned parcel arrived empty, damaged, or was the wrong item.\n\n` +
++                        `This cannot be undone.`
++                      )) return;
++                      doAction(selected.id, "/revoke-store-credit", "Store credit revoked");
++                    }}
++                    data-testid="revoke-store-credit-btn"
++                  >
++                    <XCircle size={14} className="mr-2" /> Revoke store credit (parcel damaged / empty)
++                  </button>
++                )}
+                 <button
+                   className="btn-secondary sm:col-span-1"
+                   onClick={() => setConfirmDlg({
+--- /tmp/diff_src/frontend_pages/ReturnMethod.jsx	2026-04-23 01:14:23.751481805 +0000
++++ /app/frontend/src/pages/ReturnMethod.jsx	2026-04-23 01:10:39.828482407 +0000
+@@ -16,6 +16,11 @@
+   const [loadingRates, setLoadingRates] = useState(false);
+   const [ratesError, setRatesError] = useState(null);
+   const [submitting, setSubmitting] = useState(false);
++  // When the customer picks store_credit and the return is NOT manual-review,
++  // they still need to pay for the return shipping label — either deducted
++  // from the final coupon value or paid upfront via Stripe. "deduct" is the
++  // friendlier default.
++  const [scLabelPayment, setScLabelPayment] = useState("deduct");
+ 
+   // Store-credit config pulled from /branding so the admin can tune the
+   // bonus % live without a redeploy.
+@@ -193,10 +198,39 @@
+         return;
+       }
+       if (method === "store_credit") {
+-        // Manual-review reasons hold the coupon until admin approves; other
+-        // reasons get the coupon issued by the backend on submission.
+-        const pending = requiresManualReview ? "?pending=1" : "";
+-        nav(`/return/${doc.id}/success${pending}`);
++        // Manual-review reasons hold the return until admin approves (no
++        // label or payment needed up front). All other store_credit returns
++        // now require the customer to pay for the return label — either
++        // deducted from the eventual coupon value or paid via Stripe. The
++        // coupon itself is only issued once admin confirms the parcel has
++        // physically arrived.
++        if (requiresManualReview) {
++          nav(`/return/${doc.id}/success?pending=1`);
++          return;
++        }
++        if (!selectedRate) {
++          toast.error("Select a shipping rate for your return label");
++          setSubmitting(false);
++          return;
++        }
++        if (scLabelPayment === "stripe") {
++          const r = await api.post(`/returns/${doc.id}/checkout`, {
++            rate_id: selectedRate.rate_id, origin_url: window.location.origin,
++            provider: selectedRate.provider,
++            servicelevel: selectedRate.servicelevel,
++            amount: selectedRate.amount,
++          });
++          window.location.href = r.data.url;
++          return;
++        }
++        // Default: deduct label cost from the eventual store credit.
++        await api.post(`/returns/${doc.id}/deduct-from-refund`, {
++          rate_id: selectedRate.rate_id, origin_url: window.location.origin,
++          provider: selectedRate.provider,
++          servicelevel: selectedRate.servicelevel,
++          amount: selectedRate.amount,
++        });
++        nav(`/return/${doc.id}/success?pending=1`);
+         return;
+       }
+       if (!selectedRate) { toast.error("Select a shipping rate"); setSubmitting(false); return; }
+@@ -225,7 +259,15 @@
+ 
+   if (!order) return null;
+ 
+-  const showRatesPanel = !requiresManualReview && method !== "store_credit" && (method === "pay_stripe" || method === "deduct_from_refund" || rates.length > 0 || loadingRates);
++  // Store-credit returns that DON'T need manual review now require the
++  // customer to pay for the return label too (deduct from credit OR card).
++  // Manual-review store_credit still waits for admin, no rate picker needed.
++  const storeCreditNeedsLabel = method === "store_credit" && !requiresManualReview;
++
++  const showRatesPanel = !requiresManualReview
++    && (method === "pay_stripe" || method === "deduct_from_refund"
++        || storeCreditNeedsLabel
++        || rates.length > 0 || loadingRates);
+ 
+   return (
+     <div className="min-h-screen bg-white fade-in" data-testid="method-page">
+@@ -252,6 +294,42 @@
+ 
+         {/* Shipping rates panel — visible as soon as a postcode is present so
+             the customer sees pricing before picking a method. */}
++        {showRatesPanel && storeCreditNeedsLabel && (
++          <div className="mt-8 sm:mt-10 card-flat !p-4 sm:!p-6" data-testid="store-credit-label-payment">
++            <div className="label-caps mb-3">How would you like to pay for the return label?</div>
++            <div className="grid sm:grid-cols-2 gap-3">
++              <button
++                type="button"
++                onClick={() => setScLabelPayment("deduct")}
++                className={`method-card text-left p-4 ${scLabelPayment === "deduct" ? "selected" : ""}`}
++                data-testid="sc-pay-deduct"
++              >
++                <div className="flex items-center gap-2">
++                  <Wallet size={16} />
++                  <span className="font-medium">Deduct from my store credit</span>
++                </div>
++                <div className="text-xs text-[hsl(var(--ink-muted))] mt-1">
++                  Label cost comes off your final coupon value. No card needed now.
++                </div>
++              </button>
++              <button
++                type="button"
++                onClick={() => setScLabelPayment("stripe")}
++                className={`method-card text-left p-4 ${scLabelPayment === "stripe" ? "selected" : ""}`}
++                data-testid="sc-pay-stripe"
++              >
++                <div className="flex items-center gap-2">
++                  <CreditCard size={16} />
++                  <span className="font-medium">Pay with card now</span>
++                </div>
++                <div className="text-xs text-[hsl(var(--ink-muted))] mt-1">
++                  Keep your full store credit; pay the label cost up front via Stripe.
++                </div>
++              </button>
++            </div>
++          </div>
++        )}
++
+         {showRatesPanel && (
+           <div className="mt-8 sm:mt-10" data-testid="rates-panel">
+             <div className="flex items-center justify-between mb-4">
+--- /tmp/diff_src/frontend_pages/ReturnSuccess.jsx	2026-04-23 01:14:23.752481805 +0000
++++ /app/frontend/src/pages/ReturnSuccess.jsx	2026-04-23 01:11:04.430482338 +0000
+@@ -219,11 +219,20 @@
+             </p>
+           )}
+ 
++          {isStoreCredit && doc.status === "label_purchased" && !hasCoupon && (
++            <p className="mt-6 text-sm text-[hsl(var(--ink-muted))]" data-testid="sc-pending-delivery">
++              Your label is ready above — ship your parcel and your store credit coupon will be
++              emailed to <span className="mono text-[hsl(var(--ink))] break-all">{doc.email}</span>
++              {" "}the moment we confirm it's arrived back at our warehouse.
++            </p>
++          )}
++
+           {isStoreCredit && doc.status === "awaiting_approval" && (
+             <p className="mt-6 text-sm text-[hsl(var(--ink-muted))]">
+-              Our team needs to verify this return before issuing your store credit.
+-              We'll email <span className="mono text-[hsl(var(--ink))] break-all">{doc.email}</span> with your
+-              coupon code as soon as it's approved — usually within 24 hours.
++              Your return is on the way — your store credit coupon will be emailed to
++              {" "}<span className="mono text-[hsl(var(--ink))] break-all">{doc.email}</span>
++              {" "}as soon as we physically receive and verify your parcel. This protects
++              both of us from mix-ups with damaged or missing items.
+             </p>
+           )}
+ 

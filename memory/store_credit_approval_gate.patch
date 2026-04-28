@@ -1,0 +1,102 @@
+--- /tmp/diff_src/settings_service.py	2026-04-23 00:05:33.543492514 +0000
++++ /app/backend/settings_service.py	2026-04-23 00:04:51.095492612 +0000
+@@ -30,6 +30,14 @@
+     "enable_store_credit",
+     "store_credit_bonus_percent",   # e.g. "5" gives the customer 5% extra
+     "store_credit_expiry_days",     # coupon life-time in days
++    # Anti-abuse: require admin approval before issuing store credit.
++    # - require_approval_for_store_credit: "true"/"false" master toggle.
++    # - store_credit_approval_threshold: currency amount. When toggle is ON,
++    #   approval is required only for returns whose refund_amount is >= this
++    #   threshold. Use 0 (or empty) to require approval for ALL store-credit
++    #   returns when the toggle is on.
++    "require_approval_for_store_credit",
++    "store_credit_approval_threshold",
+     # Brevo email
+     "brevo_api_key", "from_email", "from_name",
+     # Additional email providers (fallback chain)
+@@ -65,6 +73,8 @@
+     "enable_store_credit": "ENABLE_STORE_CREDIT",
+     "store_credit_bonus_percent": "STORE_CREDIT_BONUS_PERCENT",
+     "store_credit_expiry_days": "STORE_CREDIT_EXPIRY_DAYS",
++    "require_approval_for_store_credit": "REQUIRE_APPROVAL_FOR_STORE_CREDIT",
++    "store_credit_approval_threshold": "STORE_CREDIT_APPROVAL_THRESHOLD",
+     "brevo_api_key": "BREVO_API_KEY",
+     "from_email": "FROM_EMAIL",
+     "from_name": "FROM_NAME",
+@@ -91,6 +101,10 @@
+     "enable_store_credit": "true",
+     "store_credit_bonus_percent": "5",
+     "store_credit_expiry_days": "365",
++    # Default: toggle OFF (keeps current auto-issue behaviour). Admin can turn
++    # it on from Settings. Threshold 0 = applies to every store-credit return.
++    "require_approval_for_store_credit": "false",
++    "store_credit_approval_threshold": "0",
+ }
+ 
+ 
+--- /tmp/diff_src/server.py	2026-04-23 00:05:33.546492514 +0000
++++ /app/backend/server.py	2026-04-23 00:05:07.871492573 +0000
+@@ -383,6 +383,32 @@
+ 
+     refund_amount = sum(i.price * i.quantity for i in body.items)
+ 
++    # ---------------------------------------------------------------
++    # Anti-abuse gate: admin can require manual approval before any
++    # store-credit coupon is issued. Two knobs, both settable from the
++    # Admin → Settings page:
++    #   require_approval_for_store_credit  → master toggle (true/false)
++    #   store_credit_approval_threshold    → currency amount; when the
++    #       toggle is on, approval kicks in only when refund_amount is
++    #       >= threshold. 0/empty = approval required for ALL amounts.
++    # This closes the "keep the item + spend the voucher" hole by
++    # delaying coupon creation until admin has physically received /
++    # verified the return.
++    # ---------------------------------------------------------------
++    sc_approval_toggle = str(
++        cfg.get("require_approval_for_store_credit", "false")
++    ).lower() in ("1", "true", "yes", "on")
++    try:
++        sc_approval_threshold = float(
++            cfg.get("store_credit_approval_threshold") or 0
++        )
++    except (TypeError, ValueError):
++        sc_approval_threshold = 0.0
++    store_credit_needs_admin = (
++        sc_approval_toggle
++        and (sc_approval_threshold <= 0 or refund_amount >= sc_approval_threshold)
++    )
++
+     # Server-side safety: if ANY item has a seller-responsible reason, force the
+     # return onto the manual-review path — the customer cannot bypass this by
+     # crafting a request with "pay_stripe" / "deduct_from_refund" / "store_credit".
+@@ -438,10 +464,14 @@
+     doc.pop("_id", None)
+ 
+     # Auto-issue coupon for store_credit returns that do NOT need manual
+-    # review. Manual-review store_credit returns wait for admin approval and
+-    # the coupon is issued from the approve endpoint instead.
+-    if effective_method == "store_credit" and not any(
+-        i.reason in MANUAL_REVIEW_REASONS for i in body.items
++    # review AND are not gated behind the new admin-approval setting.
++    # Manual-review store_credit returns (damaged/defective/etc.) and any
++    # store_credit return caught by the approval gate wait for admin
++    # approval — the coupon is issued from the approve endpoint instead.
++    if (
++        effective_method == "store_credit"
++        and not store_credit_needs_admin
++        and not any(i.reason in MANUAL_REVIEW_REASONS for i in body.items)
+     ):
+         try:
+             updated = await _issue_store_credit_for_return(doc["id"])
+--- /tmp/diff_src/AdminSettings.jsx	2026-04-23 00:05:33.549492514 +0000
++++ /app/frontend/src/pages/AdminSettings.jsx	2026-04-23 00:05:19.026492547 +0000
+@@ -23,6 +23,8 @@
+     { key: "enable_store_credit", label: "Enable store credit option (true / false)", secret: false, placeholder: "true" },
+     { key: "store_credit_bonus_percent", label: "Bonus % added on top of refund value", secret: false, placeholder: "5" },
+     { key: "store_credit_expiry_days", label: "Coupon expiry (days)", secret: false, placeholder: "365" },
++    { key: "require_approval_for_store_credit", label: "Require admin approval before issuing store credit (true / false) — closes the \"keep item + spend voucher\" hole", secret: false, placeholder: "false" },
++    { key: "store_credit_approval_threshold", label: "…only when refund is ≥ this amount (0 or empty = every store-credit return)", secret: false, placeholder: "0" },
+   ]},
+   { title: "Weight-based shipping", fields: [
+     { key: "default_item_weight_kg", label: "Default item weight (kg) if product has no weight in Woo", secret: false, placeholder: "1.0" },

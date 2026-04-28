@@ -1,0 +1,99 @@
+@import url("https://api.fontshare.com/v2/css?f[]=cabinet-grotesk@400,500,700,800&f[]=satoshi@300,400,500,700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 0 0% 100%;
+  --surface: 40 14% 96%;     /* stone / parchment */
+  --surface-hover: 40 10% 92%;
+  --border: 40 10% 89%;
+  --ink: 20 12% 10%;         /* obsidian */
+  --ink-muted: 25 8% 46%;
+  --success: 142 72% 29%;
+  --success-bg: 140 80% 97%;
+  --destructive: 0 72% 50%;
+  --destructive-bg: 0 86% 97%;
+  --warning: 32 95% 44%;
+  --warning-bg: 45 100% 96%;
+}
+
+@layer base {
+  :root {
+    --background: var(--bg);
+    --foreground: var(--ink);
+    --card: var(--bg);
+    --card-foreground: var(--ink);
+    --popover: var(--bg);
+    --popover-foreground: var(--ink);
+    --primary: var(--ink);
+    --primary-foreground: var(--bg);
+    --secondary: var(--surface);
+    --secondary-foreground: var(--ink);
+    --muted: var(--surface);
+    --muted-foreground: var(--ink-muted);
+    --accent: var(--surface);
+    --accent-foreground: var(--ink);
+    --input: var(--border);
+    --ring: var(--ink);
+    --radius: 0.125rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+  html, body {
+    @apply bg-background text-foreground;
+    font-family: "Satoshi", ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  h1, h2, h3, h4, h5 {
+    font-family: "Cabinet Grotesk", "Satoshi", ui-sans-serif, system-ui, sans-serif;
+    letter-spacing: -0.015em;
+    font-weight: 500;
+  }
+  ::selection {
+    background: hsl(var(--ink));
+    color: hsl(var(--bg));
+  }
+}
+
+.font-mono, .mono {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+}
+
+.label-caps {
+  text-transform: uppercase;
+  font-size: 0.72rem;
+  letter-spacing: 0.22em;
+  color: hsl(var(--ink-muted));
+  font-weight: 500;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center h-12 px-7 text-sm font-medium bg-[hsl(var(--ink))] text-white border border-[hsl(var(--ink))] transition-all duration-200 hover:bg-transparent hover:text-[hsl(var(--ink))];
+}
+.btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+.btn-secondary {
+  @apply inline-flex items-center justify-center h-12 px-7 text-sm font-medium bg-transparent text-[hsl(var(--ink))] border border-[hsl(var(--border))] transition-all duration-200 hover:border-[hsl(var(--ink))];
+}
+.input-field {
+  @apply h-14 w-full px-4 text-base border border-[hsl(var(--border))] bg-white transition-colors focus:outline-none focus:ring-0 focus:border-[hsl(var(--ink))];
+  border-radius: 2px;
+}
+.card-flat {
+  @apply border border-[hsl(var(--border))] bg-white p-6 lg:p-8;
+  border-radius: 2px;
+}
+.hair { border-color: hsl(var(--border)); }
+
+.fade-in { animation: fadeIn 400ms ease-out both; }
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+
+[data-debug-wrapper="true"] { display: contents !important; }
