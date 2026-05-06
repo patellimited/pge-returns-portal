@@ -22,6 +22,10 @@ export default function AdminDashboard() {
   const [viewArchived, setViewArchived] = useState(false);
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
+  
+  // NEW: State to hold your dynamic store name, defaulting to Zanvi
+  const [storeName, setStoreName] = useState("Zanvi Returns");
+
   // Action modal: { mode: "approve" | "reject", returnId, rma }
   const [actionModal, setActionModal] = useState(null);
   // Confirm dialog: { action: "delete" | "archive" | "unarchive", returnId, rma }
@@ -37,11 +41,19 @@ export default function AdminDashboard() {
   const load = async () => {
     setLoading(true);
     try {
-      const [rRows, rStats] = await Promise.all([
+      // NEW: Safely fetches your settings from the database at the same time
+      const [rRows, rStats, rSettings] = await Promise.all([
         api.get(buildListUrl()),
         api.get("/admin/stats"),
+        api.get("/admin/settings").catch(() => ({ data: null }))
       ]);
-      setRows(rRows.data); setStats(rStats.data);
+      setRows(rRows.data); 
+      setStats(rStats.data);
+      
+      // NEW: Applies the store name from your settings page if it exists
+      if (rSettings?.data?.store_name) setStoreName(rSettings.data.store_name);
+      else if (rSettings?.data?.brand_name) setStoreName(rSettings.data.brand_name);
+
     } catch (e) {
       if (e.response?.status === 401) { localStorage.removeItem("admin_token"); nav("/admin/login"); }
       else toast.error("Failed to load");
@@ -93,7 +105,6 @@ export default function AdminDashboard() {
     try {
       const r = await api.post(`/admin/returns/${id}${path}`);
       toast.success(label);
-      // response may just be { status } — refresh the selected row from the list
       await load();
       const fresh = (await api.get(buildListUrl())).data.find((x) => x.id === id);
       if (fresh) setSelected(fresh);
@@ -132,7 +143,8 @@ export default function AdminDashboard() {
       <header className="border-b border-[hsl(var(--border))] px-4 sm:px-6 lg:px-10 py-4 flex items-center justify-between gap-2">
         <div className="flex items-center gap-3 min-w-0">
           <span className="inline-block h-2 w-2 bg-[hsl(var(--ink))]" />
-          <span className="font-medium truncate">PGE Returns</span>
+          {/* NEW: Displays your dynamic storeName variable here */}
+          <span className="font-medium truncate">{storeName}</span>
           <span className="label-caps ml-2 sm:ml-4 hidden sm:inline">Admin</span>
         </div>
         <div className="flex items-center gap-2">
