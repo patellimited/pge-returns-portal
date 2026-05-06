@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+const [storeName, setStoreName] = useState("");import React, { useEffect, useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { api, STATUS_LABELS, REASON_LABELS, formatMoney } from "../lib/api";
 import { toast } from "sonner";
@@ -24,7 +24,7 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(false);
   
   // NEW: State to hold your dynamic store name, defaulting to Zanvi
-  const [storeName, setStoreName] = useState("Zanvi Returns");
+  const [storeName, setStoreName] = useState("");
 
   // Action modal: { mode: "approve" | "reject", returnId, rma }
   const [actionModal, setActionModal] = useState(null);
@@ -144,7 +144,7 @@ export default function AdminDashboard() {
         <div className="flex items-center gap-3 min-w-0">
           <span className="inline-block h-2 w-2 bg-[hsl(var(--ink))]" />
           {/* NEW: Displays your dynamic storeName variable here */}
-          <span className="font-medium truncate">{storeName}</span>
+         <span className="font-medium truncate">{storeName || ""}</span>
           <span className="label-caps ml-2 sm:ml-4 hidden sm:inline">Admin</span>
         </div>
         <div className="flex items-center gap-2">
