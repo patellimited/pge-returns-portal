@@ -24,7 +24,7 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(false);
   
   // NEW: State to hold your dynamic store name, defaulting to Zanvi
-  const [storeName, setStoreName] = useState("");
+  const [storeName, setStoreName] = useState("Zanvi Returns");
 
   // Action modal: { mode: "approve" | "reject", returnId, rma }
   const [actionModal, setActionModal] = useState(null);
@@ -144,7 +144,7 @@ export default function AdminDashboard() {
         <div className="flex items-center gap-3 min-w-0">
           <span className="inline-block h-2 w-2 bg-[hsl(var(--ink))]" />
           {/* NEW: Displays your dynamic storeName variable here */}
-        <span className="font-medium truncate">{storeName || ""}</span>
+          <span className="font-medium truncate">{storeName}</span>
           <span className="label-caps ml-2 sm:ml-4 hidden sm:inline">Admin</span>
         </div>
         <div className="flex items-center gap-2">
