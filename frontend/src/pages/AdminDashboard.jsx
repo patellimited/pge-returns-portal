@@ -23,7 +23,7 @@ export default function AdminDashboard() {
   const [selected, setSelected] = useState(null);
   const [loading, setLoading] = useState(false);
   
-  // FIXED: Moved inside the function and starts as empty string
+  // NEW: State for the dynamic name
   const [storeName, setStoreName] = useState("");
 
   const [actionModal, setActionModal] = useState(null);
@@ -39,7 +39,6 @@ export default function AdminDashboard() {
   const load = async () => {
     setLoading(true);
     try {
-      // FIXED: Added settings fetch to the list
       const [rRows, rStats, rSettings] = await Promise.all([
         api.get(buildListUrl()),
         api.get("/admin/stats"),
@@ -48,7 +47,6 @@ export default function AdminDashboard() {
       setRows(rRows.data); 
       setStats(rStats.data);
       
-      // Pulls name if it exists in your settings page
       if (rSettings?.data?.store_name) setStoreName(rSettings.data.store_name);
       else if (rSettings?.data?.brand_name) setStoreName(rSettings.data.brand_name);
 
@@ -141,7 +139,6 @@ export default function AdminDashboard() {
       <header className="border-b border-[hsl(var(--border))] px-4 sm:px-6 lg:px-10 py-4 flex items-center justify-between gap-2">
         <div className="flex items-center gap-3 min-w-0">
           <span className="inline-block h-2 w-2 bg-[hsl(var(--ink))]" />
-          {/* FIXED: Uses correct backtick template literal syntax */}
           <span className="font-medium truncate">
             {storeName ? `${storeName} return portal` : ""}
           </span>
@@ -315,6 +312,7 @@ export default function AdminDashboard() {
                 <KV label="Label cost" v={formatMoney(selected.label_cost || 0)} />
                 {selected.refund_amount > 0 && <KV label="Refund amount" v={formatMoney(selected.refund_amount)} />}
                 {selected.tracking_number && <KV label="Tracking" v={selected.tracking_number} />}
+                {selected.email_provider_used && <KV label="Email via" v={selected.email_provider_used} />}
               </div>
 
               <div>
@@ -332,6 +330,65 @@ export default function AdminDashboard() {
                   ))}
                 </div>
               </div>
+
+              {Array.isArray(selected.customer_actions) && selected.customer_actions.length > 0 && (
+                <div data-testid="customer-actions-panel">
+                  <div className="label-caps mb-2">What the customer pressed</div>
+                  <div className="space-y-2">
+                    {selected.customer_actions.map((a, idx) => (
+                      <div key={idx} className="border-l-2 border-[hsl(var(--ink))] pl-3 py-1">
+                        <div className="text-sm">{a.label}</div>
+                        <div className="text-[10px] mono text-[hsl(var(--ink-muted))]">
+                          {a.kind} · {a.at ? new Date(a.at).toLocaleString() : ""}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {selected.method === "self_ship" && (
+                <div data-testid="self-ship-admin-panel" className="border border-[hsl(var(--ink))] bg-[hsl(var(--surface))] p-4">
+                  <div className="label-caps mb-2">Self-ship details</div>
+                  {selected.self_ship_submitted_at ? (
+                    <div className="space-y-2 text-sm">
+                      <div className="flex justify-between gap-3">
+                        <span className="text-[hsl(var(--ink-muted))]">Carrier</span>
+                        <span className="mono text-right">{selected.self_ship_carrier || "—"}</span>
+                      </div>
+                      {selected.self_ship_tracking_number && (
+                        <div className="flex justify-between gap-3">
+                          <span className="text-[hsl(var(--ink-muted))]">Tracking</span>
+                          <span className="mono text-right break-all">{selected.self_ship_tracking_number}</span>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-[hsl(var(--ink-muted))]">Customer hasn't submitted tracking yet.</div>
+                  )}
+                </div>
+              )}
+
+              {selected.admin_label_attachment && (
+                <AttachmentRow
+                  label="Approved label"
+                  attachment={selected.admin_label_attachment}
+                  href={`${api.defaults.baseURL}/admin/returns/${selected.id}/attachment/label`}
+                />
+              )}
+
+              {Array.isArray(selected.customer_proof_photos) && selected.customer_proof_photos.length > 0 && (
+                <div data-testid="customer-proof-panel">
+                  <div className="label-caps mb-2 flex items-center gap-1.5">
+                    <ImageIcon size={14} /> Customer proof photos ({selected.customer_proof_photos.length})
+                  </div>
+                  <div className="grid grid-cols-3 gap-2">
+                    {selected.customer_proof_photos.map((p, i) => (
+                      <ProofThumb key={i} idx={i} photo={p} returnId={selected.id} />
+                    ))}
+                  </div>
+                </div>
+              )}
 
               <InternalNotesPanel
                 returnId={selected.id}
@@ -351,15 +408,20 @@ export default function AdminDashboard() {
                       <CheckCircle size={16} className="mr-2" weight="fill" /> Approve
                     </button>
                     <button className="btn-secondary border-[hsl(var(--destructive))] text-[hsl(var(--destructive))]" onClick={() => setActionModal({ mode: "reject", returnId: selected.id, rma: selected.rma_number, email: selected.email, method: selected.method })}>
-                      <XCircle size={16} className="mr-2" /> Reject
+                      <XCircle size={16} className="mr-2" /> Reject with reason
                     </button>
                   </>
                 )}
+                {selected.status !== "refunded" && selected.status !== "rejected" && (
+                  <button className="btn-primary sm:col-span-2" onClick={() => doAction(selected.id, "/mark-refunded", "Marked refunded")}>
+                    Mark refunded
+                  </button>
+                )}
                 <button className="btn-secondary" onClick={() => setConfirmDlg({ action: selected.archived ? "unarchive" : "archive", returnId: selected.id, rma: selected.rma_number })}>
-                  {selected.archived ? "Unarchive" : "Archive"}
+                  {selected.archived ? <><ArrowCounterClockwise size={14} className="mr-2" /> Unarchive</> : <><Archive size={14} className="mr-2" /> Archive</>}
                 </button>
                 <button className="btn-secondary border-[hsl(var(--destructive))] text-[hsl(var(--destructive))]" onClick={() => setConfirmDlg({ action: "delete", returnId: selected.id, rma: selected.rma_number })}>
-                  Delete
+                  <Trash size={14} className="mr-2" /> Delete
                 </button>
               </div>
             </div>
@@ -395,7 +457,7 @@ export default function AdminDashboard() {
   );
 }
 
-// Helper components below remain standard to your build...
+// FULL HELPERS - ZERO TRIMMING
 function ActionModal({ mode, rma, email, method, shippingChoice, financialStage, onClose, onSubmit }) {
   const [note, setNote] = useState("");
   const [file, setFile] = useState(null);
@@ -405,7 +467,7 @@ function ActionModal({ mode, rma, email, method, shippingChoice, financialStage,
 
   const handleFile = (e) => {
     const f = e.target.files?.[0] || null;
-    if (f && f.size > 5 * 1024 * 1024) { toast.error("File too large"); return; }
+    if (f && f.size > 5 * 1024 * 1024) { toast.error("File larger than 5 MB"); return; }
     setFile(f);
   };
 
@@ -418,17 +480,38 @@ function ActionModal({ mode, rma, email, method, shippingChoice, financialStage,
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
-      <div className="relative bg-white border border-[hsl(var(--border))] w-full max-w-lg shadow-xl p-5">
-        <div className="label-caps mb-1">{isApprove ? "Approve Return" : "Reject Return"}</div>
-        <div className="mono text-sm mb-4">{rma}</div>
-        <textarea className="w-full min-h-[100px] border p-2 text-sm mb-4" placeholder="Note to customer..." value={note} onChange={(e) => setNote(e.target.value)} />
-        {!hideFileUpload && (
-          <input type="file" className="text-xs mb-4" onChange={handleFile} />
-        )}
-        <div className="flex justify-end gap-2">
-          <button className="btn-secondary h-9 px-4 text-xs" onClick={onClose}>Cancel</button>
-          <button className="btn-primary h-9 px-4 text-xs" onClick={submit} disabled={submitting}>{submitting ? "Sending..." : "Confirm"}</button>
+      <div className="absolute inset-0 bg-black/50" onClick={submitting ? undefined : onClose} />
+      <div className="relative bg-white border border-[hsl(var(--border))] w-full max-w-lg shadow-xl">
+        <div className="flex items-start justify-between p-5 border-b border-[hsl(var(--border))]">
+          <div>
+            <div className="label-caps" style={{ color: isApprove ? "hsl(var(--success))" : "hsl(var(--destructive))" }}>
+              {isApprove ? "Approve Return" : "Reject Return"}
+            </div>
+            <div className="mono text-sm mt-1">{rma}</div>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-[hsl(var(--surface))]" disabled={submitting}><X size={18} /></button>
+        </div>
+        <div className="p-5 space-y-5">
+          <div>
+            <label className="label-caps block mb-2">{isApprove ? "Note (optional)" : "Reason (required)"}</label>
+            <textarea className="w-full min-h-[110px] border p-3 text-sm focus:outline-none focus:border-[hsl(var(--ink))]" value={note} onChange={(e) => setNote(e.target.value)} />
+          </div>
+          {!hideFileUpload && (
+            <div>
+              <label className="label-caps block mb-2">{isApprove ? "Attach label" : "Attach evidence (optional)"}</label>
+              <label className="flex items-center gap-3 p-3 border border-dashed cursor-pointer hover:border-[hsl(var(--ink))]">
+                <Paperclip size={16} />
+                <span className="text-sm truncate flex-1">{file ? file.name : "Choose file (max 5 MB)"}</span>
+                <input type="file" className="hidden" onChange={handleFile} />
+              </label>
+            </div>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-2 p-5 border-t border-[hsl(var(--border))]">
+          <button className="btn-secondary h-10 px-5 text-sm" onClick={onClose} disabled={submitting}>Cancel</button>
+          <button className={`btn-primary h-10 px-6 text-sm ${!isApprove && "!bg-[hsl(var(--destructive))] !border-[hsl(var(--destructive))]"}`} onClick={submit} disabled={submitting}>
+            {submitting ? "Sending…" : isApprove ? "Approve & notify" : "Reject & notify"}
+          </button>
         </div>
       </div>
     </div>
@@ -438,29 +521,93 @@ function ActionModal({ mode, rma, email, method, shippingChoice, financialStage,
 function InternalNotesPanel({ returnId, notes, onAdded }) {
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
+  const [open, setOpen] = useState(notes.length > 0);
+
   const submit = async () => {
-    if (!draft.trim()) return;
+    const text = draft.trim();
+    if (!text) return;
     setSaving(true);
     try {
-      const r = await api.post(`/admin/returns/${returnId}/internal-notes`, { text: draft });
+      const r = await api.post(`/admin/returns/${returnId}/internal-notes`, { text });
       setDraft("");
-      onAdded?.(r.data?.note || { at: new Date().toISOString(), author: "admin", text: draft });
-    } catch (e) { toast.error("Failed"); } finally { setSaving(false); }
+      onAdded?.(r.data?.note || { at: new Date().toISOString(), author: "admin", text });
+      toast.success("Note saved");
+    } catch { toast.error("Failed"); } finally { setSaving(false); }
   };
+
   return (
     <div className="border-t pt-4">
-      <div className="label-caps mb-2">Internal Notes</div>
-      <div className="space-y-2 mb-3">
-        {notes.map((n, i) => (
-          <div key={i} className="text-xs bg-[hsl(var(--surface))] p-2 border-l-2 border-[hsl(var(--ink))]">
-            {n.text}
-            <div className="text-[10px] mt-1 opacity-50">{new Date(n.at).toLocaleString()}</div>
-          </div>
-        ))}
+      <div className="flex items-center justify-between mb-2">
+        <div className="label-caps">Internal notes (admin-only)</div>
+        <button onClick={() => setOpen(!open)} className="text-[10px] mono uppercase opacity-50 hover:opacity-100">{open ? "Hide" : `Show (${notes.length})`}</button>
       </div>
-      <textarea className="w-full text-xs border p-2" placeholder="Private note..." value={draft} onChange={(e) => setDraft(e.target.value)} />
-      <button className="btn-primary h-7 px-3 text-[10px] mt-2" onClick={submit} disabled={saving}>Add Note</button>
+      {open && (
+        <div className="space-y-3">
+          {notes.map((n, idx) => (
+            <div key={idx} className="border-l-2 border-[hsl(var(--ink))] pl-3 py-1 bg-[hsl(var(--surface))]">
+              <div className="text-sm whitespace-pre-wrap">{n.text}</div>
+              <div className="text-[10px] mono opacity-50 mt-1">{n.author} · {new Date(n.at).toLocaleString()}</div>
+            </div>
+          ))}
+          <textarea className="w-full min-h-[80px] border p-2 text-sm" placeholder="Private note..." value={draft} onChange={(e) => setDraft(e.target.value)} disabled={saving} />
+          <div className="flex justify-end"><button className="btn-primary h-8 px-4 text-[10px]" onClick={submit} disabled={saving || !draft.trim()}>{saving ? "Saving…" : "Add note"}</button></div>
+        </div>
+      )}
     </div>
+  );
+}
+
+function AttachmentRow({ label, attachment, href }) {
+  const token = localStorage.getItem("admin_token");
+  const handleDownload = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await fetch(href, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = attachment?.filename || "attachment";
+      a.click();
+    } catch { toast.error("Download failed"); }
+  };
+  return (
+    <div>
+      <div className="label-caps mb-2">{label}</div>
+      <button onClick={handleDownload} className="w-full flex items-center justify-between p-3 border hover:border-[hsl(var(--ink))] text-left">
+        <div className="flex items-center gap-3 truncate">
+          <Paperclip size={16} className="shrink-0" />
+          <span className="text-sm truncate">{attachment?.filename}</span>
+        </div>
+        <Download size={16} className="shrink-0 opacity-50" />
+      </button>
+    </div>
+  );
+}
+
+function ProofThumb({ idx, photo, returnId }) {
+  const [url, setUrl] = useState(null);
+  const token = localStorage.getItem("admin_token");
+  const href = `${api.defaults.baseURL}/admin/returns/${returnId}/proof/${idx}`;
+
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const r = await fetch(href, { headers: token ? { Authorization: `Bearer ${token}` } : {} });
+        const blob = await r.blob();
+        if (active) setUrl(URL.createObjectURL(blob));
+      } catch {}
+    })();
+    return () => { active = false; };
+  }, [href, token]);
+
+  const openFull = () => window.open(url, "_blank");
+
+  return (
+    <button onClick={openFull} className="aspect-square border overflow-hidden bg-[hsl(var(--surface))]">
+      {url ? <img src={url} alt="proof" className="w-full h-full object-cover" /> : <div className="flex h-full items-center justify-center opacity-30"><ImageIcon size={20} /></div>}
+    </button>
   );
 }
 
@@ -482,15 +629,17 @@ function MethodBadge({ method }) {
 }
 
 function ConfirmDialog({ dlg, onCancel, onConfirm }) {
+  const isDelete = dlg.action === "delete";
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/50" onClick={onCancel} />
-      <div className="relative bg-white border p-6 max-w-md w-full shadow-xl">
-        <div className="label-caps mb-2">{dlg.action} Return?</div>
-        <div className="text-sm mb-6">Are you sure you want to {dlg.action} {dlg.rma}?</div>
+      <div className="relative bg-white border border-[hsl(var(--border))] w-full max-w-md shadow-xl p-5">
+        <div className="label-caps mb-1" style={{ color: isDelete ? "hsl(var(--destructive))" : "inherit" }}>{dlg.action} return?</div>
+        <div className="mono text-sm mb-4">{dlg.rma}</div>
+        <div className="text-sm opacity-70 mb-6">Are you sure you want to {dlg.action} this return request? This action may be permanent.</div>
         <div className="flex justify-end gap-2">
-          <button className="btn-secondary px-4 py-2 text-xs" onClick={onCancel}>Cancel</button>
-          <button className="btn-primary px-4 py-2 text-xs" onClick={onConfirm}>Confirm</button>
+          <button className="btn-secondary h-10 px-5 text-sm" onClick={onCancel}>Cancel</button>
+          <button className={`btn-primary h-10 px-6 text-sm ${isDelete && "!bg-[hsl(var(--destructive))] !border-[hsl(var(--destructive))]"}`} onClick={onConfirm}>Confirm</button>
         </div>
       </div>
     </div>
