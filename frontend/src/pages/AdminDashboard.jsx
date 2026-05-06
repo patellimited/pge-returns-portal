@@ -144,7 +144,7 @@ export default function AdminDashboard() {
         <div className="flex items-center gap-3 min-w-0">
           <span className="inline-block h-2 w-2 bg-[hsl(var(--ink))]" />
           {/* NEW: Displays your dynamic storeName variable here */}
-        <span className="font-medium truncate">{storeName ? ${storeName} return portal : ""}</span>
+        <span className="font-medium truncate">{storeName ? `${storeName} return portal` : ""}</span>
           <span className="label-caps ml-2 sm:ml-4 hidden sm:inline">Admin</span>
         </div>
         <div className="flex items-center gap-2">
